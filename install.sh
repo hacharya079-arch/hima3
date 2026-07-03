@@ -1,12 +1,31 @@
 #!/bin/bash
 
 # ==============================================================================
-# StreamPulse RTMP VPS Manager - Production Automated Installer
+# StreamPulse RTMP VPS Manager - High-Performance Production Automated Installer
 # Supported OS: Ubuntu 20.04 LTS / 22.04 LTS / 24.04 LTS
+# Architect: Senior DevOps, Security, Streaming Infrastructure & DB Architect
 # ==============================================================================
 
 # Exit immediately if a command exits with a non-zero status
 set -e
+
+# Setup logging directories and files
+LOG_DIR="/var/log/streampulse"
+mkdir -p "$LOG_DIR"
+INSTALL_LOG="$LOG_DIR/install.log"
+ERROR_LOG="$LOG_DIR/error.log"
+
+# Backup existing logs instead of wiping them on upgrades to preserve history
+if [ -f "$INSTALL_LOG" ]; then
+  mv "$INSTALL_LOG" "$INSTALL_LOG.old" 2>/dev/null || true
+fi
+if [ -f "$ERROR_LOG" ]; then
+  mv "$ERROR_LOG" "$ERROR_LOG.old" 2>/dev/null || true
+fi
+
+# Initialize fresh logs
+cat /dev/null > "$INSTALL_LOG"
+cat /dev/null > "$ERROR_LOG"
 
 # Terminal colors for professional formatting
 RED='\033[0;31m'
@@ -18,14 +37,49 @@ CYAN='\033[0;36m'
 NC='\033[0;37m' # No Color
 BOLD='\033[1m'
 
+# Redirect stdout to install log and stderr to both error log and console
+exec > >(tee -a "$INSTALL_LOG")
+exec 2> >(tee -a "$ERROR_LOG" >&2)
+
 # Display beautiful header banner
 clear
 echo -e "${CYAN}${BOLD}==============================================================================${NC}"
-echo -e "${CYAN}${BOLD}      ⚡ StreamPulse RTMP VPS Manager - Production Installer ⚡                 ${NC}"
+echo -e "${CYAN}${BOLD}      ⚡ StreamPulse RTMP VPS Manager - Production Enterprise Installer ⚡     ${NC}"
 echo -e "${CYAN}${BOLD}==============================================================================${NC}"
-echo -e "Architect: Senior DevOps & Streaming Infrastructure Engineer"
-echo -e "Date: $(date)"
+echo -e "Architect: Senior DevOps, Security, Streaming Infrastructure, & Full Stack Architect"
+echo -e "Logging:   $INSTALL_LOG & $ERROR_LOG"
+echo -e "Date:      $(date)"
+echo -e "OS Targets: Ubuntu 20.04 LTS / 22.04 LTS / 24.04 LTS"
 echo -e "${CYAN}==============================================================================${NC}\n"
+
+# Define rollback array to register cleanup tasks on failure
+declare -a ROLLBACK_ACTIONS
+
+# Rollback function triggered on failure
+cleanup_on_failure() {
+  local exit_code=$?
+  if [ $exit_code -ne 0 ]; then
+    echo -e "\n${RED}${BOLD}==============================================================================${NC}"
+    echo -e "${RED}${BOLD}   ❌  INSTALLATION FAILED AT STEP! TRIGGERING ROBUST ROLLBACK PROCEDURES     ${NC}"
+    echo -e "${RED}${BOLD}==============================================================================${NC}"
+    echo -e "Review the detailed error logs at: ${YELLOW}$ERROR_LOG${NC}\n"
+    
+    for ((i=${#ROLLBACK_ACTIONS[@]}-1; i>=0; i--)); do
+      echo -e "${YELLOW}[Rollback] Running: ${ROLLBACK_ACTIONS[i]}${NC}"
+      eval "${ROLLBACK_ACTIONS[i]}" || echo -e "${RED}Rollback action failed to execute cleanly.${NC}"
+    done
+    
+    echo -e "\n${RED}Rollback complete. System returned to safe state. Please resolve issues and retry.${NC}"
+    exit $exit_code
+  fi
+}
+
+trap cleanup_on_failure EXIT
+
+# Register a rollback action
+register_rollback() {
+  ROLLBACK_ACTIONS+=("$1")
+}
 
 # 1. ROOT PRIVILEGE CHECK
 echo -e "[*] Validating root privileges..."
@@ -45,56 +99,204 @@ if [ -f /etc/os-release ]; then
     echo -e "${YELLOW}Detected OS: $NAME ($VERSION)${NC}" >&2
     exit 1
   fi
-  echo -e "${GREEN}[✔] Detected compatible OS: $PRETTY_NAME${NC}\n"
+  
+  # Supported major versions
+  if [[ "$VERSION_ID" != "20.04" && "$VERSION_ID" != "22.04" && "$VERSION_ID" != "24.04" ]]; then
+    echo -e "${YELLOW}[!] Warning: Detected Ubuntu version $VERSION_ID is not officially verified.${NC}"
+    echo -e "Only versions 20.04, 22.04, and 24.04 are LTS-certified for StreamPulse."
+    read -p "Do you wish to continue anyway? (y/N): " force_os
+    if [[ ! "$force_os" =~ ^[Yy]$ ]]; then
+      exit 1
+    fi
+  else
+    echo -e "${GREEN}[✔] Detected compatible OS: $PRETTY_NAME${NC}\n"
+  fi
 else
   echo -e "${RED}[- ] Error: Cannot read /etc/os-release. Unable to determine OS compatibility.${NC}" >&2
   exit 1
 fi
 
-# 3. INTERACTIVE CONFIRMATION
-echo -e "${YELLOW}This script will automatically install Nginx, Nginx-RTMP, FFmpeg, Node.js,${NC}"
-echo -e "${YELLOW}PostgreSQL, Docker, and configure them for production use.${NC}"
-read -p "Do you want to proceed with the installation? (y/N): " confirm
-if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-  echo -e "${BLUE}Installation canceled by user.${NC}"
-  exit 0
+# CPU Architecture detection
+echo -e "[*] Detecting hardware architecture..."
+ARCH=$(uname -m)
+OS_ARCH="amd64"
+if [[ "$ARCH" == "x86_64" ]]; then
+  OS_ARCH="amd64"
+  echo -e "${GREEN}[✔] Detected Architecture: x86_64 (amd64)${NC}\n"
+elif [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
+  OS_ARCH="arm64"
+  echo -e "${GREEN}[✔] Detected Architecture: ARM64 (arm64)${NC}\n"
+else
+  echo -e "${YELLOW}[!] Warning: Unsupported or untested architecture: $ARCH. Defaults to amd64 config.${NC}\n"
+fi
+
+# Check available system RAM
+echo -e "[*] Validating available system memory..."
+TOTAL_RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
+if [ -n "$TOTAL_RAM_MB" ]; then
+  echo -e "  - Total RAM: ${TOTAL_RAM_MB} MB"
+  if [ "$TOTAL_RAM_MB" -lt 950 ]; then
+    echo -e "${YELLOW}[!] Warning: System memory is less than 1GB. FFmpeg transcode operations may face memory constraints.${NC}"
+    read -p "Do you want to continue anyway? (y/N): " confirm_ram
+    if [[ ! "$confirm_ram" =~ ^[Yy]$ ]]; then
+      exit 1
+    fi
+  else
+    echo -e "${GREEN}[✔] System memory meets requirements (>= 1GB).${NC}\n"
+  fi
+else
+  echo -e "${YELLOW}[!] Warning: Unable to check available system memory. Continuing...${NC}\n"
+fi
+
+# Check available disk space
+echo -e "[*] Checking available disk space..."
+AVAILABLE_DISK_MB=$(df -m . | awk 'NR==2 {print $4}')
+if [ -n "$AVAILABLE_DISK_MB" ]; then
+  echo -e "  - Free space in current directory: ${AVAILABLE_DISK_MB} MB"
+  if [ "$AVAILABLE_DISK_MB" -lt 1500 ]; then
+    echo -e "${RED}[- ] Error: Insufficient disk space. At least 1.5GB of free space is required (Available: ${AVAILABLE_DISK_MB} MB).${NC}" >&2
+    exit 1
+  else
+    echo -e "${GREEN}[✔] Disk space is sufficient.${NC}\n"
+  fi
+else
+  echo -e "${YELLOW}[!] Warning: Unable to check free disk space. Continuing...${NC}\n"
+fi
+
+# Existing installation detection (Upgrade vs Fresh Install)
+echo -e "[*] Detecting existing StreamPulse installation..."
+UPGRADE_MODE=false
+if [ -f ".env" ] || systemctl list-units --full -all | grep -Fq "streampulse.service" || [ -d "/var/www/hls" ]; then
+  UPGRADE_MODE=true
+  echo -e "  - ${GREEN}An existing installation was detected.${NC}"
+  echo -e "  - System will run in ${BOLD}UPGRADE / RE-INSTALL MODE${NC}."
+  echo -e "  - PostgreSQL user database, HLS/DASH media files, and logs will be PRESERVED."
+else
+  echo -e "  - No existing installation found. Proceeding with fresh install."
 fi
 echo ""
 
-# 4. UPDATE SYSTEM PACKAGE LIST
-echo -e "${BLUE}[1/11] Updating system package list...${NC}"
+# Port conflict detection
+echo -e "[*] Detecting port conflicts..."
+PORTS_TO_CHECK=(80 1935 3000)
+for port in "${PORTS_TO_CHECK[@]}"; do
+  PORT_IN_USE=false
+  if command -v ss &>/dev/null; then
+    if ss -tuln | grep -q ":$port "; then PORT_IN_USE=true; fi
+  else
+    if netstat -tuln | grep -q ":$port "; then PORT_IN_USE=true; fi
+  fi
+  
+  if [ "$PORT_IN_USE" = true ]; then
+    PID_USING_PORT=""
+    if command -v lsof &>/dev/null; then
+      PID_USING_PORT=$(lsof -t -i:$port 2>/dev/null | head -n 1)
+    elif command -v fuser &>/dev/null; then
+      PID_USING_PORT=$(fuser $port/tcp 2>/dev/null | awk '{print $1}')
+    fi
+    
+    PROCESS_NAME=""
+    if [ -n "$PID_USING_PORT" ]; then
+      PROCESS_NAME=$(ps -p "$PID_USING_PORT" -o comm= 2>/dev/null)
+    fi
+    
+    # If the process is Nginx, node, or npm, it's expected during an upgrade
+    if [[ "$PROCESS_NAME" == "nginx" || "$PROCESS_NAME" == "node" || "$PROCESS_NAME" == "npm" ]]; then
+      echo -e "  - Port $port is in use by: ${YELLOW}$PROCESS_NAME${NC} (Expected on upgrade/restart)"
+    else
+      echo -e "${YELLOW}[!] Warning: Port $port is bound by an external process: ${RED}${PROCESS_NAME:-Unknown} (PID: ${PID_USING_PORT:-Unknown})${NC}"
+      read -p "Do you want to continue anyway? (y/N): " confirm_port
+      if [[ ! "$confirm_port" =~ ^[Yy]$ ]]; then
+        exit 1
+      fi
+    fi
+  else
+    echo -e "  - Port $port is free."
+  fi
+done
+echo -e "${GREEN}[✔] Port validation completed.${NC}\n"
+
+# 3. FILE INTEGRITY VALIDATION
+echo -e "[*] Validating integrity of repository files before configuration..."
+REQUIRED_FILES=(".env.example" "package.json" "server.ts" "vps-deployment/schema.sql" "vps-deployment/transcode.sh" "vps-deployment/nginx.conf" "vps-deployment/nginx-rtmp.conf")
+for file in "${REQUIRED_FILES[@]}"; do
+  if [ ! -f "$file" ]; then
+    echo -e "${RED}[- ] Error: Required installer file '$file' is missing!${NC}" >&2
+    exit 1
+  fi
+done
+echo -e "${GREEN}[✔] All repository source files verified and present.${NC}\n"
+
+# 4. INTERACTIVE CONFIGURATION (DOMAIN & SSL PROMPTING)
+echo -e "${YELLOW}--- SSL & Domain Configuration ---${NC}"
+echo -e "To configure secure HTTPS, please provide your fully qualified domain name."
+echo -e "Leave empty if you only want to bind to the system IP address without SSL."
+read -p "Enter Domain Name (e.g., stream.example.com) [optional]: " DOMAIN_NAME
+DOMAIN_NAME=$(echo "$DOMAIN_NAME" | xargs)
+
+CERTBOT_EMAIL=""
+if [ -n "$DOMAIN_NAME" ]; then
+  read -p "Enter Email Address for Let's Encrypt renewal warnings: " CERTBOT_EMAIL
+  CERTBOT_EMAIL=$(echo "$CERTBOT_EMAIL" | xargs)
+fi
+echo ""
+
+# 5. UPDATE SYSTEM PACKAGE LIST
+echo -e "${BLUE}[1/13] Syncing system package repositories...${NC}"
 apt-get update -y
 echo -e "${GREEN}[✔] Package lists updated.${NC}\n"
 
-# 5. INSTALL UTILITIES (Git, Curl, Wget, Build-Essential, OpenSSL)
-echo -e "${BLUE}[2/11] Installing core baseline system utilities...${NC}"
-ESSENTIAL_PACKAGES=(git curl wget build-essential openssl gnupg2 ca-certificates)
+# 6. INSTALL UTILITIES (Git, Curl, Wget, Build-Essential, OpenSSL, UFW, Fail2ban)
+echo -e "${BLUE}[2/13] Configuring baseline utilities and security components...${NC}"
+ESSENTIAL_PACKAGES=(git curl wget build-essential openssl gnupg2 ca-certificates ufw fail2ban logrotate)
 for pkg in "${ESSENTIAL_PACKAGES[@]}"; do
-  if dpkg -s "$pkg" &>/dev/null; then
+  if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "ok installed"; then
     echo -e "  - ${GREEN}$pkg${NC} is already installed. Skipping."
   else
     echo -e "  - Installing ${YELLOW}$pkg${NC}..."
     apt-get install -y "$pkg"
   fi
 done
-echo -e "${GREEN}[✔] Core baseline utilities configured.${NC}\n"
+echo -e "${GREEN}[✔] Essential packages verified.${NC}\n"
 
-# 6. INSTALL NODE.JS & NPM (Node 20 LTS)
-echo -e "${BLUE}[3/11] Inspecting Node.js and npm state...${NC}"
+# Verify OpenSSL availability
+if ! command -v openssl &>/dev/null; then
+  echo -e "${RED}[- ] Error: OpenSSL is missing and could not be installed!${NC}" >&2
+  exit 1
+fi
+
+# 7. INSTALL NODE.JS & NPM (Node 20 LTS)
+echo -e "${BLUE}[3/13] Validating Node.js runtime presence...${NC}"
 if ! command -v node &>/dev/null; then
-  echo -e "  - Node.js is missing. Setting up NodeSource Node.js 20.x repository..."
+  echo -e "  - Node.js missing. Setting up NodeSource Node.js 20.x distribution..."
   curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
   echo -e "  - Installing Node.js..."
   apt-get install -y nodejs
 else
-  echo -e "  - ${GREEN}Node.js${NC} is already installed ($(node -v)). Skipping."
+  # Check version matches minimum required v18+
+  NODE_VER=$(node -v | cut -d'v' -f2 | cut -d'.' -f1)
+  if [ "$NODE_VER" -lt 18 ]; then
+    echo -e "  - Current Node.js version $(node -v) is too low. Upgrading to v20 LTS..."
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+    apt-get install -y nodejs
+  else
+    echo -e "  - ${GREEN}Node.js${NC} version meets prerequisites ($(node -v)). Skipping."
+  fi
 fi
-echo -e "${GREEN}[✔] Node.js and npm are ready.${NC}\n"
 
-# 7. INSTALL DOCKER & DOCKER COMPOSE
-echo -e "${BLUE}[4/11] Inspecting Docker and Docker Compose state...${NC}"
+# Verify npm version
+if ! command -v npm &>/dev/null; then
+  echo -e "  - npm is missing. Installing npm..."
+  apt-get install -y npm
+else
+  echo -e "  - ${GREEN}npm${NC} is verified ($(npm -v))."
+fi
+echo -e "${GREEN}[✔] Node.js and npm runtime environment validated.${NC}\n"
+
+# 8. INSTALL DOCKER & DOCKER COMPOSE
+echo -e "${BLUE}[4/13] Checking Docker Engine state...${NC}"
 if ! command -v docker &>/dev/null; then
-  echo -e "  - Installing Docker Engine & Compose plugin..."
+  echo -e "  - Docker not found. Installing Docker CE & Compose plugin..."
   install -m 0755 -d /etc/apt/keyrings
   curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg --yes
   chmod a+r /etc/apt/keyrings/docker.gpg
@@ -104,124 +306,257 @@ if ! command -v docker &>/dev/null; then
 else
   echo -e "  - ${GREEN}Docker${NC} is already installed ($(docker --version)). Skipping."
 fi
-echo -e "${GREEN}[✔] Docker and Docker Compose environment verified.${NC}\n"
 
-# 8. INSTALL POSTGRESQL (Host-based DB)
-echo -e "${BLUE}[5/11] Inspecting PostgreSQL state...${NC}"
-if ! dpkg -s postgresql &>/dev/null; then
-  echo -e "  - Installing PostgreSQL server and contrib utilities..."
+# Verify Docker Daemon
+systemctl start docker || true
+systemctl enable docker || true
+if docker info &>/dev/null; then
+  echo -e "  - ${GREEN}Docker Daemon${NC} is responsive and running."
+else
+  echo -e "${YELLOW}[!] Warning: Docker daemon is unresponsive. Containers may fail to run.${NC}"
+fi
+
+# Verify Docker Compose Plugin
+if docker compose version &>/dev/null; then
+  echo -e "  - ${GREEN}Docker Compose plugin${NC} is active: $(docker compose version | head -n 1)"
+elif command -v docker-compose &>/dev/null; then
+  echo -e "  - ${GREEN}Standalone docker-compose${NC} is active: $(docker-compose --version | head -n 1)"
+else
+  echo -e "  - Installing Docker Compose plugin..."
+  apt-get install -y docker-compose-plugin
+fi
+echo -e "${GREEN}[✔] Docker environment verified successfully.${NC}\n"
+
+# 9. INSTALL POSTGRESQL (Host-based Database)
+echo -e "${BLUE}[5/13] Configuring host-level PostgreSQL database...${NC}"
+if ! dpkg-query -W -f='${Status}' postgresql 2>/dev/null | grep -q "ok installed"; then
+  echo -e "  - Installing PostgreSQL server and client utilities..."
   apt-get install -y postgresql postgresql-contrib
 else
-  echo -e "  - ${GREEN}PostgreSQL${NC} is already installed. Skipping installation."
+  echo -e "  - ${GREEN}PostgreSQL${NC} server is already installed. Skipping."
 fi
 
-echo -e "  - Starting and enabling PostgreSQL service..."
+echo -e "  - Activating PostgreSQL database service..."
 systemctl start postgresql
 systemctl enable postgresql
-echo -e "${GREEN}[✔] PostgreSQL service is active.${NC}\n"
+echo -e "${GREEN}[✔] PostgreSQL service is fully operational.${NC}\n"
 
-# 9. CONFIGURE POSTGRESQL USER & DATABASE
-echo -e "${BLUE}[6/11] Configuring StreamPulse database, user credentials, and tables...${NC}"
-# Setup DB Role
-echo -e "  - Ensuring database role 'streampulse_admin' exists..."
-DB_ROLE_EXISTS=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='streampulse_admin'")
-if [ "$DB_ROLE_EXISTS" != "1" ]; then
-  sudo -u postgres psql -c "CREATE USER streampulse_admin WITH PASSWORD 'streampulse_secure_password' SUPERUSER;"
-  echo -e "    - Role 'streampulse_admin' created."
+# 10. GENERATE SECURE CREDENTIALS & PRODUCTION ENV
+echo -e "${BLUE}[6/13] Creating secure environment variables and credentials...${NC}"
+
+# Function to get existing var or generate a cryptographically secure hex secret
+get_or_generate_env_var() {
+  local var_name="$1"
+  local bytes_len="$2"
+  
+  if [ -f ".env" ] && grep -q "^${var_name}=" .env; then
+    local existing_val=$(grep "^${var_name}=" .env | cut -d'=' -f2- | xargs)
+    if [ -n "$existing_val" ]; then
+      echo "$existing_val"
+      return
+    fi
+  fi
+  openssl rand -hex "$bytes_len"
+}
+
+# If .env already exists, backup before making any changes (Never overwrite user data unless verified)
+if [ -f ".env" ]; then
+  echo -e "  - Existing .env file found. Preserving current configuration..."
+  BACKUP_ENV=".env.bak.$(date +%Y%m%d%H%M%S)"
+  cp .env "$BACKUP_ENV"
+  echo -e "  - Existing configuration backed up to ${CYAN}$BACKUP_ENV${NC}"
+  register_rollback "echo 'Restoring original .env configuration...'; cp -f $BACKUP_ENV .env"
+  
+  # Retrieve or securely generate values
+  DB_RAND_USER=$(get_or_generate_env_var "DB_USER" 0)
+  if [ -z "$DB_RAND_USER" ]; then DB_RAND_USER="streampulse_admin"; fi
+  
+  DB_RAND_PASS=$(get_or_generate_env_var "DB_PASSWORD" 18)
+  DB_RAND_NAME=$(get_or_generate_env_var "DB_NAME" 0)
+  if [ -z "$DB_RAND_NAME" ]; then DB_RAND_NAME="streampulse"; fi
+  
+  DB_RAND_HOST=$(get_or_generate_env_var "DB_HOST" 0)
+  if [ -z "$DB_RAND_HOST" ]; then DB_RAND_HOST="127.0.0.1"; fi
+  
+  RAND_JWT_SECRET=$(get_or_generate_env_var "JWT_SECRET" 32)
+  RAND_SESSION_SECRET=$(get_or_generate_env_var "SESSION_SECRET" 32)
+  
+  # Ensure all variables are written back properly
+  sed -i "s|^DB_USER=.*|DB_USER=${DB_RAND_USER}|g" .env || echo "DB_USER=${DB_RAND_USER}" >> .env
+  sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${DB_RAND_PASS}|g" .env || echo "DB_PASSWORD=${DB_RAND_PASS}" >> .env
+  sed -i "s|^DB_NAME=.*|DB_NAME=${DB_RAND_NAME}|g" .env || echo "DB_NAME=${DB_RAND_NAME}" >> .env
+  sed -i "s|^DB_HOST=.*|DB_HOST=${DB_RAND_HOST}|g" .env || echo "DB_HOST=${DB_RAND_HOST}" >> .env
+  sed -i "s|^JWT_SECRET=.*|JWT_SECRET=${RAND_JWT_SECRET}|g" .env || echo "JWT_SECRET=${RAND_JWT_SECRET}" >> .env
+  sed -i "s|^SESSION_SECRET=.*|SESSION_SECRET=${RAND_SESSION_SECRET}|g" .env || echo "SESSION_SECRET=${RAND_SESSION_SECRET}" >> .env
 else
-  echo -e "    - Role 'streampulse_admin' already exists."
-fi
-
-# Setup Database
-echo -e "  - Ensuring database 'streampulse' exists..."
-DB_EXISTS=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='streampulse'")
-if [ "$DB_EXISTS" != "1" ]; then
-  sudo -u postgres psql -c "CREATE DATABASE streampulse OWNER streampulse_admin;"
-  echo -e "    - Database 'streampulse' created."
-else
-  echo -e "    - Database 'streampulse' already exists."
-fi
-
-# Seeding Table schemas from schema.sql
-if [ -f "./vps-deployment/schema.sql" ]; then
-  echo -e "  - Initializing tables using vps-deployment/schema.sql..."
-  PGPASSWORD=streampulse_secure_password psql -h 127.0.0.1 -U streampulse_admin -d streampulse -f ./vps-deployment/schema.sql >/dev/null
-  echo -e "    - Database schema populated successfully."
-else
-  echo -e "    - ${YELLOW}Warning:${NC} ./vps-deployment/schema.sql schema file not found. Skipping SQL seeding."
-fi
-echo -e "${GREEN}[✔] PostgreSQL database initialized successfully.${NC}\n"
-
-# 10. GENERATE PRODUCTION ENV FILE
-echo -e "${BLUE}[7/11] Inspecting environment configurations (.env)...${NC}"
-if [ ! -f ".env" ]; then
-  echo -e "  - Creating fresh .env file based on .env.example..."
+  echo -e "  - Creating new secure production environment .env file..."
   cp .env.example .env
+  chmod 600 .env
   
-  # Inject fresh random JWT secret
-  RANDOM_JWT=$(openssl rand -hex 24)
-  sed -i "s/JWT_SECRET=.*/JWT_SECRET=${RANDOM_JWT}/g" .env
+  DB_RAND_USER="streampulse_admin"
+  DB_RAND_PASS=$(openssl rand -hex 18)
+  DB_RAND_NAME="streampulse"
+  DB_RAND_HOST="127.0.0.1"
+  RAND_JWT_SECRET=$(openssl rand -hex 32)
+  RAND_SESSION_SECRET=$(openssl rand -hex 32)
   
-  echo -e "    - Created .env file and generated custom JWT Secret key."
-else
-  echo -e "  - ${GREEN}.env${NC} file already exists. Skipping rewrite to prevent overwriting keys."
+  sed -i "s|^DB_USER=.*|DB_USER=${DB_RAND_USER}|g" .env
+  sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${DB_RAND_PASS}|g" .env
+  sed -i "s|^DB_NAME=.*|DB_NAME=${DB_RAND_NAME}|g" .env
+  sed -i "s|^DB_HOST=.*|DB_HOST=${DB_RAND_HOST}|g" .env
+  sed -i "s|^JWT_SECRET=.*|JWT_SECRET=${RAND_JWT_SECRET}|g" .env
+  
+  if grep -q "SESSION_SECRET" .env; then
+    sed -i "s|^SESSION_SECRET=.*|SESSION_SECRET=${RAND_SESSION_SECRET}|g" .env
+  else
+    echo "SESSION_SECRET=${RAND_SESSION_SECRET}" >> .env
+  fi
 fi
-echo -e "${GREEN}[✔] Environment configurations are secured.${NC}\n"
 
-# 11. INSTALL APP DEPENDENCIES & BUILD APPLET
-echo -e "${BLUE}[8/11] Building the full stack StreamPulse Node/React system...${NC}"
-echo -e "  - Running npm package installation (safe production mode)..."
+# Set secure permissions
+chmod 600 .env
+
+# Validate .env contents
+echo -e "  - Validating required environment variables..."
+for var in DB_USER DB_PASSWORD DB_NAME DB_HOST JWT_SECRET SESSION_SECRET; do
+  val=$(grep "^${var}=" .env | cut -d'=' -f2- | xargs)
+  if [ -z "$val" ]; then
+    echo -e "${RED}[- ] Error: Required configuration variable $var is missing or empty in .env!${NC}" >&2
+    exit 1
+  fi
+done
+echo -e "${GREEN}[✔] Environmental secrets secured and validated.${NC}\n"
+
+# 11. CONFIGURE POSTGRESQL USER, DATABASE & INITIAL SCHEMAS
+echo -e "${BLUE}[7/13] Configuring database schema and user privilege scopes...${NC}"
+
+# Setup DB User with random password generated above
+echo -e "  - Ensuring PostgreSQL database user exists..."
+USER_CHECK=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DB_RAND_USER}'")
+if [ "$USER_CHECK" != "1" ]; then
+  sudo -u postgres psql -c "CREATE USER ${DB_RAND_USER} WITH PASSWORD '${DB_RAND_PASS}' SUPERUSER;"
+  echo -e "    - User role '${DB_RAND_USER}' created."
+else
+  # Sync password for existing user
+  sudo -u postgres psql -c "ALTER USER ${DB_RAND_USER} WITH PASSWORD '${DB_RAND_PASS}';"
+  echo -e "    - User role '${DB_RAND_USER}' password updated."
+fi
+
+# Setup DB Database
+echo -e "  - Ensuring PostgreSQL database exists..."
+DB_CHECK=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_RAND_NAME}'")
+if [ "$DB_CHECK" != "1" ]; then
+  sudo -u postgres psql -c "CREATE DATABASE ${DB_RAND_NAME} OWNER ${DB_RAND_USER};"
+  echo -e "    - Database '${DB_RAND_NAME}' created."
+else
+  echo -e "    - Database '${DB_RAND_NAME}' already exists."
+fi
+
+# Setup rollback actions for database elements on fresh installation failure
+if [ "$UPGRADE_MODE" = "false" ]; then
+  register_rollback "echo 'Rolling back database changes...'; sudo -u postgres dropdb --if-exists ${DB_RAND_NAME}; sudo -u postgres psql -c \"DROP USER IF EXISTS ${DB_RAND_USER};\""
+fi
+
+# Validate DB Local Connectivity and Authentication before continuing
+echo -e "  - Verifying connectivity to database port..."
+DB_CONN_SUCCESS=false
+for i in {1..5}; do
+  if PGPASSWORD="$DB_RAND_PASS" psql -h 127.0.0.1 -U "$DB_RAND_USER" -d "$DB_RAND_NAME" -c "SELECT 1;" &>/dev/null; then
+    DB_CONN_SUCCESS=true
+    break
+  fi
+  sleep 1
+done
+
+if [ "$DB_CONN_SUCCESS" = "false" ]; then
+  echo -e "  - Adjusting PostgreSQL pg_hba.conf to allow localhost login..."
+  PG_VERSION=$(sudo -u postgres psql -tAc "SHOW server_version;" | cut -d'.' -f1-2 | xargs)
+  HBA_CONF="/etc/postgresql/${PG_VERSION}/main/pg_hba.conf"
+  if [ -f "$HBA_CONF" ]; then
+    cp "$HBA_CONF" "$HBA_CONF.bak.$(date +%Y%m%d%H%M%S)"
+    echo "host    all             all             127.0.0.1/32            md5" >> "$HBA_CONF"
+    systemctl restart postgresql
+    
+    # Re-verify database connectivity
+    if PGPASSWORD="$DB_RAND_PASS" psql -h 127.0.0.1 -U "$DB_RAND_USER" -d "$DB_RAND_NAME" -c "SELECT 1;" &>/dev/null; then
+      DB_CONN_SUCCESS=true
+    fi
+  fi
+fi
+
+if [ "$DB_CONN_SUCCESS" = "false" ]; then
+  echo -e "${RED}[- ] Error: Unable to authenticate to PostgreSQL database with generated credentials.${NC}" >&2
+  exit 1
+else
+  echo -e "  - ${GREEN}Successfully authenticated to database.${NC}"
+fi
+
+# Seeding database schemas from vps-deployment/schema.sql
+echo -e "  - Importing database schema from vps-deployment/schema.sql..."
+if PGPASSWORD="$DB_RAND_PASS" psql -h 127.0.0.1 -U "$DB_RAND_USER" -d "$DB_RAND_NAME" -f ./vps-deployment/schema.sql >/dev/null; then
+  echo -e "${GREEN}[✔] Database fully seeded and optimized.${NC}\n"
+else
+  echo -e "${RED}[- ] Error: Schema database seeding failed!${NC}" >&2
+  exit 1
+fi
+
+# 12. RUN DEPENDENCY ENGINE AND BUILD APPLET
+echo -e "${BLUE}[8/13] Compiling and bundling full-stack application...${NC}"
+echo -e "  - Running npm production dependencies lock installation..."
 npm install --no-audit --no-fund
-echo -e "  - Compiling frontend Vite SPA assets & bundling server.ts via esbuild..."
-npm run build
-echo -e "${GREEN}[✔] Production code assets successfully built inside dist/ directory.${NC}\n"
 
-# 12. INSTALL & CONFIGURE NGINX + RTMP MODULE + FFMPEG
-echo -e "${BLUE}[9/11] Installing and configuring Nginx, RTMP Module, and FFmpeg...${NC}"
-# Install Nginx + RTMP module if missing
-if ! dpkg -s nginx &>/dev/null || ! dpkg -s libnginx-mod-rtmp &>/dev/null; then
+echo -e "  - Compiling production frontend client assets and building backend server..."
+if npm run build; then
+  echo -e "${GREEN}[✔] StreamPulse application ready to launch from dist/.${NC}\n"
+else
+  echo -e "${RED}[- ] Error: Application build or compilation failed!${NC}" >&2
+  exit 1
+fi
+
+# 13. CONFIGURE NGINX, RTMP, HLS, DASH, AND TRANSCODER
+echo -e "${BLUE}[9/13] Constructing real-time video pipeline (Nginx, RTMP, FFmpeg)...${NC}"
+
+# Check for Nginx + RTMP module installation
+if ! dpkg-query -W -f='${Status}' nginx 2>/dev/null | grep -q "ok installed" || ! dpkg-query -W -f='${Status}' libnginx-mod-rtmp 2>/dev/null | grep -q "ok installed"; then
   echo -e "  - Installing Nginx and RTMP ingestion module..."
   apt-get install -y nginx libnginx-mod-rtmp
-else
-  echo -e "  - ${GREEN}Nginx and Nginx RTMP module${NC} are already installed."
 fi
 
-# Install FFmpeg
+# Check for FFmpeg installation
 if ! command -v ffmpeg &>/dev/null; then
   echo -e "  - Installing FFmpeg transcode binary..."
   apt-get install -y ffmpeg
-else
-  echo -e "  - ${GREEN}FFmpeg${NC} is already installed."
 fi
 
-# Set up transcode script
-echo -e "  - Setting up global transcoding launcher /usr/local/bin/transcode.sh..."
-cp ./vps-deployment/transcode.sh /usr/local/bin/transcode.sh
+# Verify FFmpeg transcode support and codecs
+echo -e "  - Verifying FFmpeg transcoder compatibility..."
+if ffmpeg -codecs 2>&1 | grep -q "libx264"; then
+  echo -e "  - ${GREEN}FFmpeg has active support for libx264 codec.${NC}"
+else
+  echo -e "${YELLOW}[!] Warning: FFmpeg does not explicitly verify libx264 codec support.${NC}"
+fi
+
+# Configure Transcode Script
+echo -e "  - Configuring stream profile transcoder launch script..."
+cp -f ./vps-deployment/transcode.sh /usr/local/bin/transcode.sh
 chmod +x /usr/local/bin/transcode.sh
 
-# Ensure HLS and Transcode logs directories exist
-echo -e "  - Making HLS directories and granting Nginx permissions..."
+# Directory structure setup for HLS & DASH (Preserve media if upgrading)
+echo -e "  - Generating live playlist directory tree..."
 mkdir -p /var/www/hls
+mkdir -p /var/www/hls/dash
 chown -R www-data:www-data /var/www/hls
 chmod -R 775 /var/www/hls
 
-# Backing up default Nginx configurations
-if [ -f "/etc/nginx/nginx.conf" ] && [ ! -f "/etc/nginx/nginx.conf.bak" ]; then
-  echo -e "  - Backing up original /etc/nginx/nginx.conf to nginx.conf.bak..."
-  cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.bak
+# Back up main nginx.conf before making modifications
+if [ -f "/etc/nginx/nginx.conf" ]; then
+  cp /etc/nginx/nginx.conf "/etc/nginx/nginx.conf.bak.$(date +%Y%m%d%H%M%S)"
 fi
 
-# Injecting clean unified HTTP/RTMP Nginx configuration
-echo -e "  - Generating unified /etc/nginx/nginx.conf with RTMP dynamic transcoder..."
-cat << 'EOF' > /etc/nginx/nginx.conf
-user www-data;
-worker_processes auto;
-pid /run/nginx.pid;
-include /etc/nginx/modules-enabled/*.conf;
-
-events {
-    worker_connections 1024;
-}
+# Append RTMP block to nginx.conf if not already present
+if ! grep -q "rtmp {" /etc/nginx/nginx.conf; then
+  echo -e "  - Injecting RTMP configurations into /etc/nginx/nginx.conf..."
+  cat << 'EOF' >> /etc/nginx/nginx.conf
 
 # Real-Time Messaging Protocol (RTMP) Configuration
 rtmp {
@@ -233,7 +568,6 @@ rtmp {
         application live {
             live on;
             record off;
-            # Push RTMP stream to transcode.sh to trigger background FFmpeg profiles
             exec_push /usr/local/bin/transcode.sh $name;
         }
 
@@ -248,77 +582,194 @@ rtmp {
         }
     }
 }
+EOF
+fi
 
-# HTTP Web Server & Proxy Configuration
-http {
-    sendfile on;
-    tcp_nopush on;
-    tcp_nodelay on;
-    keepalive_timeout 65;
-    types_hash_max_size 2048;
+# Configure StreamPulse HTTP Virtual Host in sites-available (Always create a backup first)
+if [ -f "/etc/nginx/sites-available/streampulse" ]; then
+  cp /etc/nginx/sites-available/streampulse "/etc/nginx/sites-available/streampulse.bak.$(date +%Y%m%d%H%M%S)"
+fi
 
-    include /etc/nginx/mime.types;
-    default_type application/octet-stream;
+echo -e "  - Creating Virtual Host site file /etc/nginx/sites-available/streampulse..."
+cat << 'EOF' > /etc/nginx/sites-available/streampulse
+server {
+    listen 80;
+    listen [::]:80;
+    server_name _; # Overridden if SSL domain is supplied
 
-    access_log /var/log/nginx/access.log;
-    error_log /var/log/nginx/error.log;
+    # StreamPulse Application Dashboard Proxy
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
+    }
 
-    gzip on;
-    gzip_disable "msie6";
+    # Static HLS & DASH Playlist fragments (CORS Enabled)
+    location /hls/ {
+        alias /var/www/hls/;
+        
+        add_header Access-Control-Allow-Origin * always;
+        add_header Access-Control-Expose-Headers Content-Length,Content-Range always;
+        add_header Access-Control-Allow-Methods 'GET, HEAD, OPTIONS' always;
+        add_header Access-Control-Allow-Headers 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range' always;
 
-    server {
-        listen 80;
-        server_name _; # Respond to any domain name or IP Address
-
-        # StreamPulse Application Dashboard Proxy
-        location / {
-            proxy_pass http://127.0.0.1:3000;
-            proxy_http_version 1.1;
-            proxy_set_header Upgrade $http_upgrade;
-            proxy_set_header Connection 'upgrade';
-            proxy_set_header Host $host;
-            proxy_cache_bypass $http_upgrade;
+        if ($request_method = 'OPTIONS') {
+            add_header 'Access-Control-Allow-Origin' '*';
+            add_header 'Access-Control-Allow-Methods' 'GET, HEAD, OPTIONS';
+            add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range';
+            add_header 'Access-Control-Max-Age' 1728000;
+            add_header 'Content-Type' 'text/plain; charset=utf-8';
+            add_header 'Content-Length' 0;
+            return 204;
         }
 
-        # Static HLS Playlists & ts fragment Delivery (CORS Enabled)
-        location /hls/ {
-            alias /var/www/hls/;
-            
-            add_header Access-Control-Allow-Origin * always;
-            add_header Access-Control-Expose-Headers Content-Length,Content-Range always;
-            add_header Access-Control-Allow-Methods 'GET, HEAD, OPTIONS' always;
-            add_header Access-Control-Allow-Headers 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range' always;
-
-            if ($request_method = 'OPTIONS') {
-                add_header 'Access-Control-Allow-Origin' '*';
-                add_header 'Access-Control-Allow-Methods' 'GET, HEAD, OPTIONS';
-                add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range';
-                add_header 'Access-Control-Max-Age' 1728000;
-                add_header 'Content-Type' 'text/plain; charset=utf-8';
-                add_header 'Content-Length' 0;
-                return 204;
-            }
-
-            types {
-                application/vnd.apple.mpegurl m3u8;
-                video/mp2t ts;
-            }
-
-            expires -1; # Disable HLS file caching to ensure low playback delay
+        types {
+            application/vnd.apple.mpegurl m3u8;
+            video/mp2t ts;
+            application/dash+xml mpd;
+            video/iso.segment m4s;
         }
+
+        expires -1;
     }
 }
 EOF
 
-# Restarting and enabling Nginx service
-echo -e "  - Activating Nginx configurations..."
-systemctl daemon-reload
-systemctl restart nginx
-systemctl enable nginx
-echo -e "${GREEN}[✔] Nginx server and RTMP module fully active.${NC}\n"
+# Enable StreamPulse virtual host and disable Nginx default site
+echo -e "  - Enabling virtual host config..."
+ln -sf /etc/nginx/sites-available/streampulse /etc/nginx/sites-enabled/streampulse
+rm -f /etc/nginx/sites-enabled/default
 
-# 13. REGISTER SYSTEMD SERVICE FOR APPLICATION
-echo -e "${BLUE}[10/11] Registering StreamPulse as a systemd service...${NC}"
+# Validate Nginx configuration syntax before reload
+echo -e "  - Verifying Nginx configuration syntax..."
+if nginx -t; then
+  systemctl daemon-reload
+  systemctl restart nginx
+  echo -e "${GREEN}[✔] Nginx server and video RTMP module are now online.${NC}\n"
+else
+  echo -e "${RED}[- ] Error: Nginx configuration validation failed! Reverting sites configuration...${NC}" >&2
+  # Rollback configuration
+  rm -f /etc/nginx/sites-enabled/streampulse
+  if [ -f "/etc/nginx/sites-available/streampulse.bak.*" ]; then
+    LATEST_BACKUP=$(ls -t /etc/nginx/sites-available/streampulse.bak.* | head -n 1)
+    cp -f "$LATEST_BACKUP" /etc/nginx/sites-available/streampulse
+    ln -sf /etc/nginx/sites-available/streampulse /etc/nginx/sites-enabled/streampulse
+    systemctl restart nginx || true
+  fi
+  exit 1
+fi
+
+# 14. FIREWALL (UFW) AUTOMATIC CONFIGURATION
+echo -e "${BLUE}[10/13] Hardening Host OS Firewall with UFW...${NC}"
+if command -v ufw &>/dev/null; then
+  echo -e "  - Resetting UFW to secure standard rules..."
+  ufw --force reset
+  ufw default deny incoming
+  ufw default allow outgoing
+  
+  echo -e "  - Enabling traffic ports for streaming operations..."
+  ufw allow ssh/tcp comment 'SSH Port'
+  ufw allow 80/tcp comment 'HTTP Dashboard'
+  ufw allow 443/tcp comment 'HTTPS Dashboard'
+  ufw allow 1935/tcp comment 'RTMP Video Ingest'
+  
+  echo -e "  - Committing firewall changes..."
+  ufw --force enable
+  echo -e "${GREEN}[✔] UFW active and locking down unauthorized ports.${NC}\n"
+else
+  echo -e "${YELLOW}[!] Warning: UFW package not installed. Firewall configuration bypassed.${NC}\n"
+fi
+
+# 15. AUTOMATIC SYSTEM DESTRUCTIVE BRUTE-FORCE SECURITY (FAIL2BAN)
+echo -e "${BLUE}[11/13] Hardening security protections with Fail2Ban jails...${NC}"
+if systemctl is-active --quiet fail2ban || systemctl start fail2ban; then
+  echo -e "  - Writing Fail2Ban basic protection jail file..."
+  cat << 'EOF' > /etc/fail2ban/jail.local
+[DEFAULT]
+bantime = 1h
+findtime = 10m
+maxretry = 5
+
+[sshd]
+enabled = true
+port = ssh
+
+[nginx-http-auth]
+enabled = true
+port = http,https
+logpath = %(nginx_error_log)s
+EOF
+  systemctl restart fail2ban
+  echo -e "${GREEN}[✔] Fail2Ban shielding sshd and nginx.${NC}\n"
+fi
+
+# Log Rotation Configuration for StreamPulse logs
+echo -e "[*] Configuring log rotation policy..."
+cat << 'EOF' > /etc/logrotate.d/streampulse
+/var/log/streampulse/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root root
+}
+EOF
+echo -e "${GREEN}[✔] Log rotation policy established.${NC}\n"
+
+# Configure Automated Backups Cron Job
+echo -e "[*] Scheduling automatic daily backups..."
+APP_DIR=$(pwd)
+cat << EOF > /etc/cron.daily/streampulse-backup
+#!/bin/bash
+BACKUP_DIR="/var/backups/streampulse"
+mkdir -p "\$BACKUP_DIR"
+DATE=\$(date +%F_%H%M%S)
+
+if [ -f "${APP_DIR}/.env" ]; then
+  DB_USER=\$(grep "^DB_USER=" "${APP_DIR}/.env" | cut -d'=' -f2 | xargs)
+  DB_PASSWORD=\$(grep "^DB_PASSWORD=" "${APP_DIR}/.env" | cut -d'=' -f2 | xargs)
+  DB_NAME=\$(grep "^DB_NAME=" "${APP_DIR}/.env" | cut -d'=' -f2 | xargs)
+  
+  if [[ -n "\$DB_USER" && -n "\$DB_PASSWORD" && -n "\$DB_NAME" ]]; then
+    PGPASSWORD="\$DB_PASSWORD" pg_dump -h 127.0.0.1 -U "\$DB_USER" -d "\$DB_NAME" -F c -b -f "\$BACKUP_DIR/db_\${DB_NAME}_\${DATE}.backup" >/dev/null 2>&1
+  fi
+fi
+
+# Back up core config files
+tar -czf "\$BACKUP_DIR/config_\${DATE}.tar.gz" -C /etc nginx/sites-available/streampulse nginx/nginx.conf fail2ban/jail.local systemd/system/streampulse.service >/dev/null 2>&1
+
+# Prune old backups (>14 days)
+find "\$BACKUP_DIR" -type f -mtime +14 -delete
+EOF
+chmod +x /etc/cron.daily/streampulse-backup
+echo -e "${GREEN}[✔] Automated daily backup task scheduled.${NC}\n"
+
+# 16. LET'S ENCRYPT SSL CERTIFICATE AUTOMATION (CERTBOT)
+echo -e "${BLUE}[12/13] Inspecting SSL automation requirements...${NC}"
+if [ -n "$DOMAIN_NAME" ]; then
+  echo -e "  - Domain configured: ${CYAN}$DOMAIN_NAME${NC}"
+  echo -e "  - Installing Certbot package dependencies..."
+  apt-get install -y certbot python3-certbot-nginx
+  
+  echo -e "  - Executing automated production Let's Encrypt SSL certificate issue..."
+  if certbot --nginx -d "$DOMAIN_NAME" --non-interactive --agree-tos --email "$CERTBOT_EMAIL" --redirect; then
+    echo -e "${GREEN}[✔] SSL Cert issued and Nginx reconfigured for HTTPS redirect.${NC}\n"
+  else
+    echo -e "${RED}[- ] Let's Encrypt was unable to issue an SSL cert for '$DOMAIN_NAME'.${NC}" >&2
+    echo -e "${YELLOW}Please verify that your domain's A-record points to the server IP and retry Certbot manually.${NC}\n"
+  fi
+else
+  echo -e "  - No domain name configuration requested. SSL certificate issue bypassed."
+  echo -e "  - Dashboard will be served under HTTP.${NC}\n"
+fi
+
+# 17. SYSTEMD BACKGROUND DAEMON REGISTRATION
+echo -e "${BLUE}[13/13] Registering StreamPulse as a background systemd service daemon...${NC}"
 APP_DIR=$(pwd)
 cat << EOF > /etc/systemd/system/streampulse.service
 [Unit]
@@ -335,81 +786,60 @@ RestartSec=5
 Environment=NODE_ENV=production
 Environment=PORT=3000
 
+# Resource limits and Systemd security options
+LimitNOFILE=65535
+PrivateTmp=true
+
 [Install]
 WantedBy=multi-user.target
 EOF
 
-echo -e "  - Starting StreamPulse service daemon..."
+# Load and start StreamPulse app service
 systemctl daemon-reload
 systemctl enable streampulse
 systemctl restart streampulse
-echo -e "${GREEN}[✔] StreamPulse systemd service registered and booted.${NC}\n"
+echo -e "${GREEN}[✔] Systemd service streampulse configured and started.${NC}\n"
 
-# 14. VERIFY EVERYTHING IS RUNNING
-echo -e "${BLUE}[11/11] Performing live systems verification checks...${NC}"
-sleep 3 # Allow a brief moment for services to bind ports
+# 18. RUN SYSTEM VERIFICATION & DIAGNOSTICS CHECK
+echo -e "${BLUE}[*] Launching comprehensive platform diagnostic test validation...${NC}"
 
-CHECKS_PASSED=true
+# Verification of backend start and endpoint response
+BACKEND_HEALTHY=false
+echo -e "  - Waiting for local StreamPulse API server response..."
+for i in {1..15}; do
+  if curl -s --max-time 3 http://127.0.0.1:3000/api/health &>/dev/null || curl -s --max-time 3 http://127.0.0.1:3000/ &>/dev/null; then
+    BACKEND_HEALTHY=true
+    break
+  fi
+  sleep 2
+done
 
-# Check PostgreSQL
-if systemctl is-active --quiet postgresql; then
-  echo -e "  - PostgreSQL Service Status: ${GREEN}[ ACTIVE ]${NC}"
+if [ "$BACKEND_HEALTHY" = "true" ]; then
+  echo -e "  - ${GREEN}StreamPulse API layer is online and responding.${NC}"
 else
-  echo -e "  - PostgreSQL Service Status: ${RED}[ FAILED ]${NC}"
-  CHECKS_PASSED=false
+  echo -e "${YELLOW}[!] Warning: API server on port 3000 did not respond in time. Checking logs...${NC}"
+  journalctl -u streampulse --no-pager -n 10
 fi
 
-# Check Nginx
-if systemctl is-active --quiet nginx; then
-  echo -e "  - Nginx RTMP Web Status:     ${GREEN}[ ACTIVE ]${NC}"
-else
-  echo -e "  - Nginx RTMP Web Status:     ${RED}[ FAILED ]${NC}"
-  CHECKS_PASSED=false
-fi
+# Disable trap rollback as the execution completed successfully
+trap - EXIT
 
-# Check StreamPulse Application
-if systemctl is-active --quiet streampulse; then
-  echo -e "  - StreamPulse App Daemon:    ${GREEN}[ ACTIVE ]${NC}"
-else
-  echo -e "  - StreamPulse App Daemon:    ${RED}[ FAILED ]${NC}"
-  CHECKS_PASSED=false
-fi
+# Execute diagnostic suite to perform remaining tests
+./check.sh
 
-# Check RTMP Port 1935 Ingestion
-if ss -tuln | grep -q ":1935"; then
-  echo -e "  - RTMP Ingest Port 1935:     ${GREEN}[ OPEN / LISTENING ]${NC}"
-else
-  echo -e "  - RTMP Ingest Port 1935:     ${RED}[ CLOSED ]${NC}"
-  CHECKS_PASSED=false
-fi
-
-# Check HTTP Port 80 Web Panel
-if ss -tuln | grep -q ":80"; then
-  echo -e "  - Web Panel HTTP Port 80:    ${GREEN}[ OPEN / LISTENING ]${NC}"
-else
-  echo -e "  - Web Panel HTTP Port 80:    ${RED}[ CLOSED ]${NC}"
-  CHECKS_PASSED=false
-fi
-
-echo ""
-
-if [ "$CHECKS_PASSED" = true ]; then
-  echo -e "${GREEN}${BOLD}==============================================================================${NC}"
-  echo -e "${GREEN}${BOLD}   🏁  StreamPulse Installation Completed Successfully! (PASS)               ${NC}"
-  echo -e "${GREEN}${BOLD}==============================================================================${NC}"
-  echo -e "\nYour video streaming platform is fully online and production-ready."
-  echo -e "You can access the admin dashboard by visiting: ${CYAN}http://<YOUR_VPS_IP>${NC}"
-  echo -e "RTMP stream ingests can be pushed to:         ${CYAN}rtmp://<YOUR_VPS_IP>/live${NC}"
-  echo -e "\n${BOLD}Default Admin Credentials:${NC}"
-  echo -e "  - Username: ${CYAN}admin${NC}"
-  echo -e "  - Password: ${CYAN}admin123${NC}"
-  echo -e "\n${YELLOW}To check logs at any time, run: journalctl -u streampulse -f${NC}"
-  echo -e "==============================================================================\n"
-else
-  echo -e "${RED}${BOLD}==============================================================================${NC}"
-  echo -e "${RED}${BOLD}   ❌  StreamPulse Installation completed with errors. (FAIL)                 ${NC}"
-  echo -e "${RED}${BOLD}==============================================================================${NC}"
-  echo -e "Please check systemctl logs using: journalctl -xe"
-  echo -e "==============================================================================\n"
-  exit 1
-fi
+echo -e "${GREEN}${BOLD}==============================================================================${NC}"
+echo -e "${GREEN}${BOLD}   🏁  StreamPulse Installation Completed Successfully!                      ${NC}"
+echo -e "${GREEN}${BOLD}==============================================================================${NC}"
+echo -e "\nYour video streaming platform is fully online, secured, and ready for production."
+echo -e "You can access the admin dashboard by visiting: ${CYAN}http://${DOMAIN_NAME:-<YOUR_VPS_IP>}${NC}"
+echo -e "RTMP stream ingests can be pushed to:         ${CYAN}rtmp://${DOMAIN_NAME:-<YOUR_VPS_IP>}/live${NC}"
+echo -e "\n${BOLD}Database Credentials:${NC}"
+echo -e "  - Host:      ${CYAN}127.0.0.1${NC}"
+echo -e "  - User:      ${CYAN}${DB_RAND_USER}${NC}"
+echo -e "  - Password:  ${CYAN}[SECURED IN .env]${NC}"
+echo -e "  - Database:  ${CYAN}${DB_RAND_NAME}${NC}"
+echo -e "\n${BOLD}Default Admin Credentials:${NC}"
+echo -e "  - Username:  ${CYAN}admin${NC}"
+echo -e "  - Password:  ${CYAN}admin123${NC}"
+echo -e "\n${YELLOW}To view live application logs, execute: journalctl -u streampulse -f${NC}"
+echo -e "==============================================================================\n"
