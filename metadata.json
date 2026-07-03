@@ -1,0 +1,11 @@
+{
+  "name": "StreamPulse VPS Manager",
+  "description": "A professional RTMP stream management dashboard for VPS-hosted broadcasting services, featuring broadcaster controls, live multi-player viewing, and AI-powered stream analytics.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

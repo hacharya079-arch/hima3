@@ -1,0 +1,71 @@
+# StreamPulse Docker Compose Production Deployment Configuration
+
+version: '3.8'
+
+services:
+  # StreamPulse Core: Node.js Express server + React SPA front-end + Nginx RTMP/FFmpeg Transcoder
+  streampulse:
+    build:
+      context: ..
+      dockerfile: vps-deployment/Dockerfile
+    container_name: streampulse_manager
+    ports:
+      - "1935:1935" # RTMP ingest port
+      - "80:80"     # HTTP reverse proxy
+      - "443:443"   # HTTPS SSL reverse proxy
+      - "3000:3000" # Direct Node manager interface
+    environment:
+      - NODE_ENV=production
+      - JWT_SECRET=change_this_to_a_secure_random_key_in_production_129841824
+      - DB_HOST=postgres_db
+      - DB_PORT=5432
+      - DB_USER=streampulse_admin
+      - DB_PASSWORD=streampulse_secure_db_pass_19824
+      - DB_NAME=streampulse
+    volumes:
+      - hls_storage:/var/www/hls
+      - certbot_conf:/etc/letsencrypt
+      - certbot_www:/var/www/certbot
+    depends_on:
+      - postgres_db
+    restart: always
+
+  # PostgreSQL Database Container
+  postgres_db:
+    image: postgres:16-alpine
+    container_name: streampulse_db
+    environment:
+      - POSTGRES_DB=streampulse
+      - POSTGRES_USER=streampulse_admin
+      - POSTGRES_PASSWORD=streampulse_secure_db_pass_19824
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U streampulse_admin -d streampulse"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Certbot Let's Encrypt Service for Automated HTTPS Certificates
+  certbot:
+    image: certbot/certbot
+    container_name: streampulse_certbot
+    volumes:
+      - certbot_conf:/etc/letsencrypt
+      - certbot_www:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap \"exit 0\" 15; while true; do certbot renew; sleep 12h; done'"
+    depends_on:
+      - streampulse
+
+volumes:
+  postgres_data:
+    driver: local
+  hls_storage:
+    driver: local
+  certbot_conf:
+    driver: local
+  certbot_www:
+    driver: local
