@@ -72,9 +72,52 @@ sudo systemctl enable fail2ban
 sudo systemctl start fail2ban
 ```
 
+### Step 3.4: One-Click Native Systemd Installer (Option A)
+If you prefer running StreamPulse natively directly on the host VPS (to maximize CPU/GPU utilization for FFmpeg transcoding and utilize a dedicated system-level unprivileged user):
+
+1. **Clone the repository and enter the directory**:
+   ```bash
+   git clone <your-repository-url>
+   cd streampulse-vps-manager
+   ```
+
+2. **Make the scripts executable**:
+   ```bash
+   chmod +x install.sh check.sh uninstall.sh
+   ```
+
+3. **Launch the automatic installer**:
+   ```bash
+   sudo ./install.sh
+   ```
+   This will completely automate:
+   - NodeSource Node.js 20.x GPG key signature & repository configuration.
+   - Dedicated unprivileged system user (`streampulse`) creation & file permission setup.
+   - Secure PostgreSQL system role configuration (`NOSUPERUSER`) and schema initialization.
+   - Nginx core installation + RTMP stream profile ingestion module integration.
+   - Systemd background service daemon registration.
+   - Certbot automatic Let's Encrypt SSL certificate generation.
+   - UFW firewall & Fail2Ban jail activation.
+
+### Step 3.5: Health & Security Audits
+To inspect your local services, hardware limits, log permissions, database credentials, and jail configurations at any point:
+```bash
+sudo ./check.sh
+```
+
+### Step 3.6: Native Decommission & Uninstall
+To cleanly wipe or revert the native StreamPulse setup from your host server, support interactive prompt or non-interactive mode (`--yes` or `NON_INTERACTIVE=true`):
+```bash
+sudo ./uninstall.sh
+```
+Or for non-interactive automated teardowns:
+```bash
+sudo ./uninstall.sh --yes
+```
+
 ---
 
-## 4. Docker & Docker Compose Setup
+## 4. Docker & Docker Compose Setup (Option B)
 
 Deploying via Docker is the highly recommended approach as it bundles Nginx, RTMP Module, FFmpeg, Node.js, and PostgreSQL into a secure microservice net.
 
