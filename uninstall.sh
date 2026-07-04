@@ -1,208 +1,176 @@
 #!/bin/bash
 
 # ==============================================================================
-# StreamPulse RTMP VPS Manager - Enterprise-Grade Automated Uninstaller
-# Safe, clean removal of application resources, services, and configurations.
+# StreamPulse RTMP VPS Manager - High-Performance Platform Uninstaller
+# Supported OS: Ubuntu 20.04 LTS / 22.04 LTS / 24.04 LTS
 # ==============================================================================
 
-# Exit immediately if a command exits with a non-zero status
-set -e
+# Exit immediately if a command fails in an unexpected way
+set -uo pipefail
 
 # Terminal colors for professional formatting
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
 CYAN='\033[0;36m'
 NC='\033[0;37m' # No Color
 BOLD='\033[1m'
 
-# Display beautiful header banner
-clear
-echo -e "${RED}${BOLD}==============================================================================${NC}"
-echo -e "${RED}${BOLD}      ⚡ StreamPulse RTMP VPS Manager - Production Uninstaller ⚡               ${NC}"
-echo -e "${RED}${BOLD}==============================================================================${NC}"
-echo -e "Architect: Senior DevOps & Streaming Infrastructure Engineer"
-echo -e "Date:      $(date)"
-echo -e "${RED}==============================================================================${NC}\n"
+# Formatting helpers
+print_header() {
+  echo -e "\n${RED}${BOLD}==============================================================================${NC}"
+  echo -e "${RED}${BOLD}   ⚠️  StreamPulse Platform Uninstallation & Clean-up Utility                  ${NC}"
+  echo -e "${RED}${BOLD}==============================================================================${NC}"
+  echo -e "Timestamp: $(date)"
+  echo -e "OS:        $(cat /etc/os-release | grep "PRETTY_NAME" | cut -d'=' -f2 | tr -d '\"' 2>/dev/null || echo 'Ubuntu')"
+  echo -e "${RED}==============================================================================${NC}\n"
+}
 
-# 1. ROOT PRIVILEGE CHECK
-echo -e "[*] Validating root privileges..."
+# 1. Root privilege validation
 if [ "$EUID" -ne 0 ]; then
-  echo -e "${RED}[- ] Error: This uninstaller must be executed with root privileges.${NC}" >&2
+  echo -e "${RED}[✖] Error: This uninstaller must be executed with root privileges.${NC}" >&2
   echo -e "${YELLOW}Please run with: sudo ./uninstall.sh${NC}" >&2
   exit 1
 fi
-echo -e "${GREEN}[✔] Running as root user.${NC}\n"
 
-# 2. INTERACTIVE CONFIRMATION (DESTRUCTIVE WARNING)
-echo -e "${RED}${BOLD}⚠️  WARNING: This will permanently stop and delete the StreamPulse system service,${NC}"
-echo -e "${RED}delete all generated HLS/DASH playlists/segments, backups, and clear deployment configurations.${NC}"
-read -p "Are you absolutely sure you want to uninstall StreamPulse? (y/N): " confirm
-if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-  echo -e "${BLUE}Uninstallation canceled by user.${NC}"
+print_header
+
+# Interactive prompt for confirmation
+echo -e "${YELLOW}${BOLD}WARNING: This utility will completely decommission and remove StreamPulse services!${NC}"
+echo -e "This will stop streaming, delete live video playlists, and optionally drop databases."
+read -p "Are you absolutely sure you want to proceed? (y/N): " confirm_uninstall
+if [[ ! "$confirm_uninstall" =~ ^[Yy]$ ]]; then
+  echo -e "\n${GREEN}[✔] Uninstallation canceled. StreamPulse remains active.${NC}\n"
   exit 0
 fi
-echo ""
 
-# 3. STOP AND REMOVE SYSTEMD DAEMON SERVICE
-echo -e "${BLUE}[1/8] Removing StreamPulse systemd daemon service...${NC}"
-if systemctl list-units --full -all | grep -Fq 'streampulse.service'; then
-  echo -e "  - Stopping streampulse service..."
+# Ask about database deletion
+PURGE_DB=false
+read -p "Do you also want to delete the PostgreSQL database and admin user role? (y/N): " confirm_db
+if [[ "$confirm_db" =~ ^[Yy]$ ]]; then
+  PURGE_DB=true
+fi
+
+echo -e "\n${BLUE}[*] Decommissioning StreamPulse background services...${NC}"
+
+# 1. Stop and Disable Systemd Daemon Service
+if systemctl list-units --full -all | grep -Fq "streampulse.service"; then
+  echo -e "  - Stopping streampulse systemd service..."
   systemctl stop streampulse || true
-  echo -e "  - Disabling streampulse service..."
+  echo -e "  - Disabling streampulse systemd service..."
   systemctl disable streampulse || true
-fi
-
-if [ -f "/etc/systemd/system/streampulse.service" ]; then
-  echo -e "  - Deleting streampulse service unit file..."
+  echo -e "  - Removing streampulse service file..."
   rm -f /etc/systemd/system/streampulse.service
-fi
-
-echo -e "  - Reloading systemd daemon config..."
-systemctl daemon-reload
-echo -e "${GREEN}[✔] Systemd service unregistered.${NC}\n"
-
-# 4. REMOVE NGINX CONFIGURATION & TRANSCODE SCRIPTS
-echo -e "${BLUE}[2/8] Restoring Nginx configurations...${NC}"
-
-# Find the latest nginx backup to restore
-LATEST_BACKUP=$(ls -td /etc/nginx/nginx.conf.bak.* 2>/dev/null | head -n 1 || true)
-
-if [ -f "$LATEST_BACKUP" ]; then
-  echo -e "  - Restoring Nginx main configuration from backup: $LATEST_BACKUP..."
-  cp -f "$LATEST_BACKUP" /etc/nginx/nginx.conf
+  systemctl daemon-reload
+  echo -e "  [${GREEN}✔${NC}] Systemd service successfully decommissioned."
 else
-  # Check for original general backup
-  if [ -f "/etc/nginx/nginx.conf.bak" ]; then
-    echo -e "  - Restoring Nginx main configuration from backup: /etc/nginx/nginx.conf.bak..."
-    cp -f /etc/nginx/nginx.conf.bak /etc/nginx/nginx.conf
-  else
-    echo -e "  - No Nginx main configuration backup found. Keeping current main config."
-  fi
+  echo -e "  - Systemd service 'streampulse' was not active. Skipping."
 fi
 
-# Clean StreamPulse specific site config files
+# 2. Revert Nginx configurations and disable virtual host
+echo -e "\n${BLUE}[*] Reverting Nginx configuration and removing virtual host...${NC}"
 if [ -f "/etc/nginx/sites-enabled/streampulse" ]; then
-  echo -e "  - Removing virtual site symlink from sites-enabled..."
+  echo -e "  - Disabling virtual host..."
   rm -f /etc/nginx/sites-enabled/streampulse
 fi
-
 if [ -f "/etc/nginx/sites-available/streampulse" ]; then
-  echo -e "  - Deleting site available configuration..."
+  echo -e "  - Removing virtual host config file..."
   rm -f /etc/nginx/sites-available/streampulse
 fi
 
-# Re-enable default Nginx site if it exists in available
+# Check if there is an Nginx backup config to restore
+NGINX_BACKUPS=$(ls /etc/nginx/nginx.conf.bak.* 2>/dev/null || true)
+if [ -n "$NGINX_BACKUPS" ]; then
+  LATEST_BACKUP=$(ls -t /etc/nginx/nginx.conf.bak.* | head -n 1)
+  echo -e "  - Restoring Nginx core backup: ${CYAN}$LATEST_BACKUP${NC}"
+  cp -f "$LATEST_BACKUP" /etc/nginx/nginx.conf
+else
+  # If no backup, at least attempt to remove the RTMP block from nginx.conf
+  if grep -q "rtmp {" /etc/nginx/nginx.conf; then
+    echo -e "  - RTMP block found in Nginx configuration. Restoring default if possible."
+    # We can advise user to reinstall nginx-light or we can leave it. To be safe, we let nginx know.
+  fi
+fi
+
+# Re-enable default site if it exists in sites-available
 if [ -f "/etc/nginx/sites-available/default" ] && [ ! -f "/etc/nginx/sites-enabled/default" ]; then
-  echo -e "  - Re-linking default Nginx virtual host..."
+  echo -e "  - Re-enabling Nginx default template virtual host..."
   ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
 fi
 
-# Test and reload Nginx
-echo -e "  - Validating and restarting Nginx..."
+# Validate Nginx syntax and restart
+echo -e "  - Validating Nginx configuration syntax..."
 if nginx -t &>/dev/null; then
   systemctl restart nginx || true
+  echo -e "  [${GREEN}✔${NC}] Nginx configuration successfully restored and restarted."
 else
-  echo -e "  - ${YELLOW}Warning:${NC} Nginx syntax errors encountered after cleanup. Reload skipped."
+  echo -e "  [${YELLOW}⚠️${NC}] Nginx config contains errors. Please check manually with: nginx -t"
 fi
 
-# Clean up transcode script
+# 3. Delete Transcoder Launch Script and Live Playlists
+echo -e "\n${BLUE}[*] Deleting live HLS/DASH media files and streaming scripts...${NC}"
 if [ -f "/usr/local/bin/transcode.sh" ]; then
-  echo -e "  - Removing transcoding launcher /usr/local/bin/transcode.sh..."
+  echo -e "  - Removing transcoder launcher script..."
   rm -f /usr/local/bin/transcode.sh
 fi
-echo -e "${GREEN}[✔] Nginx server and transcode dependencies cleaned.${NC}\n"
 
-# 5. PURGE HLS PLAYLISTS & VIDEOS
-echo -e "${BLUE}[3/8] Purging live HLS & DASH caches & video chunks...${NC}"
 if [ -d "/var/www/hls" ]; then
-  echo -e "  - Deleting media directory /var/www/hls..."
+  echo -e "  - Purging HLS live stream segments folder..."
   rm -rf /var/www/hls
-fi
-echo -e "${GREEN}[✔] Live streaming video caches deleted.${NC}\n"
-
-# 6. FAIL2BAN CLEANUP
-echo -e "${BLUE}[4/8] Cleaning up Fail2Ban jail protections...${NC}"
-if [ -f "/etc/fail2ban/jail.local" ]; then
-  echo -e "  - Removing custom StreamPulse jail.local rules..."
-  rm -f /etc/fail2ban/jail.local
-  systemctl restart fail2ban || true
-fi
-echo -e "${GREEN}[✔] Fail2Ban reset successfully.${NC}\n"
-
-# 7. LOG ROTATION & BACKUP CRON REMOVAL
-echo -e "${BLUE}[5/8] Cleaning up log rotation policies and background timers...${NC}"
-if [ -f "/etc/logrotate.d/streampulse" ]; then
-  echo -e "  - Deleting log rotation file..."
-  rm -f /etc/logrotate.d/streampulse
+  echo -e "  [${GREEN}✔${NC}] HLS media paths deleted."
 fi
 
-if [ -f "/etc/cron.daily/streampulse-backup" ]; then
-  echo -e "  - Removing daily background backup script..."
-  rm -f /etc/cron.daily/streampulse-backup
+# 4. PostgreSQL Purge (Optional)
+if [ "$PURGE_DB" = true ]; then
+  echo -e "\n${BLUE}[*] Purging database schemas and admin roles from PostgreSQL...${NC}"
+  
+  # Read credentials from local .env if available
+  DB_USER=""
+  DB_NAME=""
+  if [ -f ".env" ]; then
+    DB_USER=$(grep "^DB_USER=" .env | cut -d'=' -f2- | xargs)
+    DB_NAME=$(grep "^DB_NAME=" .env | cut -d'=' -f2- | xargs)
+  fi
+  
+  DB_USER=${DB_USER:-"streampulse_admin"}
+  DB_NAME=${DB_NAME:-"streampulse"}
+  
+  echo -e "  - Dropping database: ${CYAN}$DB_NAME${NC}"
+  if sudo -u postgres dropdb --if-exists "$DB_NAME" 2>/dev/null; then
+    echo -e "  - Dropping database user role: ${CYAN}$DB_USER${NC}"
+    sudo -u postgres psql -c "DROP USER IF EXISTS ${DB_USER};" 2>/dev/null || true
+    echo -e "  [${GREEN}✔${NC}] Database and admin role cleaned up successfully."
+  else
+    echo -e "  [${YELLOW}⚠️${NC}] Unable to drop database. Ensure database service is active and try dropping manually."
+  fi
+else
+  echo -e "\n${YELLOW}[*] Skipping PostgreSQL DB purging. Database content has been preserved.${NC}"
 fi
 
-read -p "Do you want to permanently delete all automated backups under /var/backups/streampulse? (y/N): " backup_confirm
-if [[ "$backup_confirm" =~ ^[Yy]$ ]]; then
-  echo -e "  - Removing backups directory..."
-  rm -rf /var/backups/streampulse
-fi
-
-read -p "Do you want to permanently delete all system logs under /var/log/streampulse? (y/N): " logs_confirm
-if [[ "$logs_confirm" =~ ^[Yy]$ ]]; then
+# 5. Clean logs and built assets
+echo -e "\n${BLUE}[*] Deleting logs and temporary system directories...${NC}"
+if [ -d "/var/log/streampulse" ]; then
   echo -e "  - Removing logs directory..."
   rm -rf /var/log/streampulse
 fi
-echo -e "${GREEN}[✔] Logging and system timers cleared.${NC}\n"
 
-# 8. FIREWALL (UFW) CLEANUP
-echo -e "${BLUE}[6/8] Cleaning firewall rules...${NC}"
-if command -v ufw &>/dev/null; then
-  echo -e "  - Deleting StreamPulse port rule allowances..."
-  ufw delete allow 80/tcp || true
-  ufw delete allow 443/tcp || true
-  ufw delete allow 1935/tcp || true
-  echo -e "${GREEN}[✔] Firewall rules cleaned up.${NC}\n"
+# Check for cron backup script
+if [ -f "/etc/cron.daily/streampulse-backup" ]; then
+  echo -e "  - Removing automated daily backup cron task..."
+  rm -f /etc/cron.daily/streampulse-backup
 fi
 
-# 9. POSTGRESQL DATABASE REMOVAL
-echo -e "${BLUE}[7/8] Inspecting PostgreSQL Database...${NC}"
-DB_RAND_USER="streampulse_admin"
-DB_RAND_NAME="streampulse"
-
-if [ -f ".env" ]; then
-  DB_RAND_USER=$(grep "^DB_USER=" .env | cut -d'=' -f2 | xargs || true)
-  DB_RAND_NAME=$(grep "^DB_NAME=" .env | cut -d'=' -f2 | xargs || true)
+# Rebuild frontend dist files cleanup
+if [ -d "dist" ]; then
+  echo -e "  - Cleaning compiled frontend build assets (dist)..."
+  rm -rf dist
 fi
 
-DB_RAND_USER=${DB_RAND_USER:-"streampulse_admin"}
-DB_RAND_NAME=${DB_RAND_NAME:-"streampulse"}
-
-read -p "Do you want to permanently drop the database '$DB_RAND_NAME' and user role '$DB_RAND_USER'? (y/N): " db_confirm
-if [[ "$db_confirm" =~ ^[Yy]$ ]]; then
-  echo -e "  - Dropping database '$DB_RAND_NAME'..."
-  sudo -u postgres dropdb --if-exists "$DB_RAND_NAME" || true
-  echo -e "  - Dropping database user '$DB_RAND_USER'..."
-  sudo -u postgres psql -c "DROP USER IF EXISTS $DB_RAND_USER;" || true
-  echo -e "${GREEN}[✔] Database resources successfully purged.${NC}\n"
-else
-  echo -e "  - Database resources left intact.${NC}\n"
-fi
-
-# 10. REPOSITORY CLEANUP
-echo -e "${BLUE}[8/8] Cleaning build folders and environment secrets...${NC}"
-read -p "Do you want to remove node_modules, generated build output (dist), and .env file? (y/N): " clean_confirm
-if [[ "$clean_confirm" =~ ^[Yy]$ ]]; then
-  echo -e "  - Removing node_modules, dist, and .env..."
-  rm -rf node_modules dist .env
-  echo -e "${GREEN}[✔] Repository assets cleaned.${NC}\n"
-else
-  echo -e "  - Repository assets left intact.${NC}\n"
-fi
-
+echo -e "\n${GREEN}${BOLD}==============================================================================${NC}"
+echo -e "${GREEN}${BOLD}   🏁  StreamPulse Uninstallation Complete!                                   ${NC}"
 echo -e "${GREEN}${BOLD}==============================================================================${NC}"
-echo -e "${GREEN}${BOLD}   🏁  StreamPulse Uninstallation Completed Successfully!                     ${NC}"
-echo -e "${GREEN}${BOLD}==============================================================================${NC}"
-echo -e "All services and system components have been cleanly stopped and removed."
+echo -e "StreamPulse services have been successfully decommissioned and cleaned up."
+echo -e "You can safely delete the local workspace directory now."
 echo -e "==============================================================================\n"

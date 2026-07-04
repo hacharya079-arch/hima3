@@ -2323,7 +2323,8 @@ segment3.ts
   const wss = new WebSocketServer({ noServer: true });
 
   httpServer.on('upgrade', (request, socket, head) => {
-    const pathname = new URL(request.url || '', `http://${request.headers.host}`).pathname;
+    const rawUrl = request.url || '';
+    const pathname = rawUrl.split('?')[0].replace(/\/$/, '');
 
     if (pathname === '/api/device-ws' || pathname === '/api/dashboard-ws') {
       wss.handleUpgrade(request, socket, head, (ws) => {
@@ -2335,9 +2336,11 @@ segment3.ts
   });
 
   wss.on('connection', async (ws: any, request: any) => {
-    const urlObj = new URL(request.url || '', `http://${request.headers.host}`);
-    const token = urlObj.searchParams.get('token');
-    const pathname = urlObj.pathname;
+    const rawUrl = request.url || '';
+    const pathname = rawUrl.split('?')[0].replace(/\/$/, '');
+    const queryStr = rawUrl.split('?')[1] || '';
+    const searchParams = new URLSearchParams(queryStr);
+    const token = searchParams.get('token');
 
     if (pathname === '/api/dashboard-ws') {
       dashboardConnections.add(ws);

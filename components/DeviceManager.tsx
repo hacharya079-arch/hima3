@@ -215,8 +215,8 @@ export const DeviceManager: React.FC<DeviceManagerProps> = ({ token, streams }) 
         }
       };
 
-      ws.onclose = () => {
-        console.log('[Dashboard WS] Disconnected. Reconnecting in 3 seconds...');
+      ws.onclose = (event) => {
+        console.log(`[Dashboard WS] Disconnected (Code: ${event.code}, Reason: ${event.reason || 'None'}). Reconnecting in 3 seconds...`);
         setTimeout(connectWs, 3000);
       };
 

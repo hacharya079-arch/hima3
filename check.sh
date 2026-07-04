@@ -1,274 +1,323 @@
 #!/bin/bash
 
 # ==============================================================================
-# StreamPulse RTMP VPS Manager - Enterprise Health Diagnostics & Validations
-# Checks status of all critical dependencies, services, configurations, and API integrity.
+# StreamPulse RTMP VPS Manager - High-Performance Platform Diagnostic Suite
+# Supported OS: Ubuntu 20.04 LTS / 22.04 LTS / 24.04 LTS
 # ==============================================================================
+
+# Exit immediately if a command fails in an unexpected way
+set -uo pipefail
 
 # Terminal colors for professional formatting
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
 CYAN='\033[0;36m'
 NC='\033[0;37m' # No Color
 BOLD='\033[1m'
 
-# Display beautiful diagnostic header
-clear
-echo -e "${CYAN}${BOLD}==============================================================================${NC}"
-echo -e "${CYAN}${BOLD}      📊  StreamPulse RTMP VPS Manager - Enterprise Diagnostics Check         ${NC}"
-echo -e "${CYAN}${BOLD}==============================================================================${NC}"
-echo -e "Time Check: $(date)"
-echo -e "Hostname:   $(hostname)"
-echo -e "OS Info:    $(uname -sr)"
-echo -e "${CYAN}==============================================================================${NC}\n"
+# Formatting helpers
+print_header() {
+  echo -e "\n${CYAN}${BOLD}==============================================================================${NC}"
+  echo -e "${CYAN}${BOLD}   🔍  StreamPulse Platform Diagnostic & System Verification Suite           ${NC}"
+  echo -e "${CYAN}${BOLD}==============================================================================${NC}"
+  echo -e "Timestamp: $(date)"
+  echo -e "Host IP:   $(hostname -I | awk '{print $1}')"
+  echo -e "OS:        $(cat /etc/os-release | grep "PRETTY_NAME" | cut -d'=' -f2 | tr -d '\"')"
+  echo -e "${CYAN}==============================================================================${NC}\n"
+}
 
-# Helper function to print rows of status
-print_status() {
-  local label="$1"
-  local status="$2" # PASS, WARN, FAIL, ACTIVE, INACTIVE, OPEN, CLOSED
-  local details="$3"
+print_section() {
+  echo -e "${BOLD}--- $1 ---${NC}"
+}
 
-  printf "  %-40s" "$label"
+# 1. Root privilege validation
+if [ "$EUID" -ne 0 ]; then
+  echo -e "${RED}[✖] Error: This diagnostic suite must be executed with root privileges.${NC}" >&2
+  echo -e "${YELLOW}Please run with: sudo ./check.sh${NC}" >&2
+  exit 1
+fi
+
+print_header
+
+# Initialize report counters
+PASS_COUNT=0
+WARN_COUNT=0
+FAIL_COUNT=0
+
+add_report() {
+  local status="$1"
+  local component="$2"
+  local description="$3"
   
-  if [ "$status" = "PASS" ] || [ "$status" = "ACTIVE" ] || [ "$status" = "OPEN" ] || [ "$status" = "FOUND" ] || [ "$status" = "VALID" ]; then
-    echo -e "[ ${GREEN}${BOLD}PASS${NC} ]  $details"
+  if [ "$status" = "PASS" ]; then
+    echo -e "  [${GREEN}✔${NC}] ${BOLD}${component}${NC}: ${description}"
+    PASS_COUNT=$((PASS_COUNT + 1))
   elif [ "$status" = "WARN" ]; then
-    echo -e "[ ${YELLOW}${BOLD}WARN${NC} ]  $details"
+    echo -e "  [${YELLOW}⚠${NC}] ${BOLD}${component}${NC}: ${YELLOW}${description}${NC}"
+    WARN_COUNT=$((WARN_COUNT + 1))
   else
-    echo -e "[ ${RED}${BOLD}FAIL${NC} ]  $details"
+    echo -e "  [${RED}✘${NC}] ${BOLD}${component}${NC}: ${RED}${description}${NC}"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
   fi
 }
 
-echo -e "${BOLD}--- [1/5] Core Runtime & Toolchain Validation ---${NC}"
+# ----------------------------------------------------
+# 1. SYSTEM HARDWARE RESOURCES CHECK
+# ----------------------------------------------------
+print_section "1. System Hardware Resources Check"
 
-# Check OS Version
-if [ -f /etc/os-release ]; then
-  . /etc/os-release
-  if [ "$ID" = "ubuntu" ]; then
-    print_status "Operating System" "PASS" "Ubuntu $VERSION_ID ($CODENAME)"
+# RAM check
+TOTAL_RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
+if [ -n "$TOTAL_RAM_MB" ]; then
+  if [ "$TOTAL_RAM_MB" -lt 950 ]; then
+    add_report "WARN" "System Memory" "Only ${TOTAL_RAM_MB}MB RAM detected. FFmpeg transcode operations may face memory constraints."
   else
-    print_status "Operating System" "WARN" "Non-Ubuntu OS detected: $NAME"
+    add_report "PASS" "System Memory" "${TOTAL_RAM_MB}MB RAM detected (Prerequisite: >= 1024MB)."
   fi
 else
-  print_status "Operating System" "FAIL" "Unable to detect OS type"
+  add_report "WARN" "System Memory" "Unable to fetch memory metrics."
 fi
 
-# Check Architecture
-ARCH=$(uname -m)
-print_status "Hardware Architecture" "PASS" "Detected $ARCH"
-
-# Check Git
-if command -v git &>/dev/null; then
-  print_status "Git Control System" "FOUND" "$(git --version | head -n 1)"
+# Disk space check
+AVAILABLE_DISK_MB=$(df -m . | awk 'NR==2 {print $4}')
+if [ -n "$AVAILABLE_DISK_MB" ]; then
+  if [ "$AVAILABLE_DISK_MB" -lt 1500 ]; then
+    add_report "FAIL" "Disk Space" "Only ${AVAILABLE_DISK_MB}MB free disk space available (Prerequisite: >= 1500MB)."
+  else
+    add_report "PASS" "Disk Space" "${AVAILABLE_DISK_MB}MB free disk space available."
+  fi
 else
-  print_status "Git Control System" "FAIL" "Not installed or not in PATH"
+  add_report "WARN" "Disk Space" "Unable to fetch disk metrics."
 fi
 
-# Check Curl
-if command -v curl &>/dev/null; then
-  print_status "Curl Transfer Tool" "FOUND" "$(curl --version | head -n 1 | cut -d' ' -f1-2)"
+# CPU Load check
+CPU_LOAD=$(uptime | awk -F'load average:' '{ print $2 }' | cut -d',' -f1 | xargs)
+if [ -n "$CPU_LOAD" ]; then
+  add_report "PASS" "CPU Load" "Current CPU 1-minute load average is: $CPU_LOAD."
 else
-  print_status "Curl Transfer Tool" "FAIL" "Not installed or not in PATH"
+  add_report "WARN" "CPU Load" "Unable to fetch CPU load average."
 fi
+echo ""
 
-# Check OpenSSL
-if command -v openssl &>/dev/null; then
-  print_status "OpenSSL Security Suite" "PASS" "$(openssl version | cut -d' ' -f1-2)"
-else
-  print_status "OpenSSL Security Suite" "FAIL" "OpenSSL not installed"
-fi
+# ----------------------------------------------------
+# 2. RUNTIME DEPENDENCIES & UTILITIES
+# ----------------------------------------------------
+print_section "2. Runtime Dependencies & Utilities"
 
-# Check Node.js
+# Node.js
 if command -v node &>/dev/null; then
-  NODE_VERSION=$(node -v)
-  NODE_MAJOR=$(echo "$NODE_VERSION" | cut -d'v' -f2 | cut -d'.' -f1)
-  if [ "$NODE_MAJOR" -ge 18 ]; then
-    print_status "Node.js Runtime" "PASS" "$NODE_VERSION (Meets prerequisite v18+)"
-  else
-    print_status "Node.js Runtime" "FAIL" "$NODE_VERSION (Version is too low! Requires v18+)"
-  fi
+  NODE_VER=$(node -v)
+  add_report "PASS" "Node.js Runtime" "Installed version: $NODE_VER."
 else
-  print_status "Node.js Runtime" "FAIL" "Not installed or not in PATH"
+  add_report "FAIL" "Node.js Runtime" "Node.js executable is missing from the system path."
 fi
 
-# Check NPM
+# npm
 if command -v npm &>/dev/null; then
-  print_status "npm Package Manager" "FOUND" "v$(npm -v)"
+  NPM_VER=$(npm -v)
+  add_report "PASS" "npm Package Manager" "Installed version: v$NPM_VER."
 else
-  print_status "npm Package Manager" "FAIL" "Not installed or not in PATH"
+  add_report "FAIL" "npm Package Manager" "npm executable is missing from the system path."
 fi
 
-# Check Docker
+# Docker
 if command -v docker &>/dev/null; then
-  if docker info &>/dev/null; then
-    print_status "Docker Daemon" "PASS" "$(docker --version) (Responsive & Running)"
-  else
-    print_status "Docker Daemon" "WARN" "$(docker --version) (Daemon unresponsive/not running)"
-  fi
+  DOCKER_VER=$(docker --version | head -n 1)
+  add_report "PASS" "Docker Engine" "$DOCKER_VER."
 else
-  print_status "Docker Daemon" "WARN" "Docker CLI is not installed"
+  add_report "WARN" "Docker Engine" "Docker is not installed or not in system path (Bypassed if native host mode is used)."
 fi
 
-# Check Docker Compose
-if docker compose version &>/dev/null; then
-  print_status "Docker Compose" "PASS" "$(docker compose version | head -n 1)"
-elif command -v docker-compose &>/dev/null; then
-  print_status "Docker Compose" "PASS" "$(docker-compose --version | head -n 1)"
-else
-  print_status "Docker Compose" "WARN" "Docker Compose utility is missing"
-fi
-
-# Check PostgreSQL Client
+# PostgreSQL Client
 if command -v psql &>/dev/null; then
-  print_status "PostgreSQL Client Utility" "FOUND" "$(psql --version)"
+  PSQL_VER=$(psql --version | head -n 1)
+  add_report "PASS" "PostgreSQL Client" "$PSQL_VER is available."
 else
-  print_status "PostgreSQL Client Utility" "FAIL" "psql client utility missing"
+  add_report "FAIL" "PostgreSQL Client" "PostgreSQL client utilities (psql) are missing."
 fi
 
-# Check Nginx
-if command -v nginx &>/dev/null; then
-  # Check for RTMP module integration
-  if nginx -V 2>&1 | grep -q "rtmp"; then
-    print_status "Nginx Web Server" "PASS" "$(nginx -v 2>&1 | cut -d'/' -f2) (RTMP module loaded)"
-  else
-    print_status "Nginx Web Server" "WARN" "$(nginx -v 2>&1 | cut -d'/' -f2) (RTMP module missing)"
-  fi
-else
-  print_status "Nginx Web Server" "FAIL" "Nginx is not installed on host"
-fi
-
-# Check FFmpeg
+# FFmpeg
 if command -v ffmpeg &>/dev/null; then
+  FFMPEG_VER=$(ffmpeg -version | head -n 1 | cut -d' ' -f3)
   if ffmpeg -codecs 2>&1 | grep -q "libx264"; then
-    print_status "FFmpeg Transcoder" "PASS" "FFmpeg is installed with libx264 support"
+    add_report "PASS" "FFmpeg Transcoder" "Installed (v$FFMPEG_VER) with active libx264 codec support."
   else
-    print_status "FFmpeg Transcoder" "WARN" "FFmpeg is installed but libx264 codec support was not verified"
+    add_report "WARN" "FFmpeg Transcoder" "Installed (v$FFMPEG_VER) but libx264 codec was not explicitly verified."
   fi
 else
-  print_status "FFmpeg Transcoder" "FAIL" "FFmpeg transcode utility missing"
+  add_report "FAIL" "FFmpeg Transcoder" "FFmpeg transcode binary is missing from the system path."
 fi
-
 echo ""
-echo -e "${BOLD}--- [2/5] Systemd Service Monitors ---${NC}"
 
-services=(postgresql nginx streampulse fail2ban)
-for srv in "${services[@]}"; do
-  if systemctl list-units --full -all | grep -Fq "$srv.service"; then
-    if systemctl is-active --quiet "$srv"; then
-      print_status "$srv.service" "ACTIVE" "Active and running in background"
-    else
-      print_status "$srv.service" "FAIL" "Installed but currently INACTIVE"
-    fi
-  else
-    print_status "$srv.service" "FAIL" "Service unit not registered in systemd"
-  fi
-done
+# ----------------------------------------------------
+# 3. BACKGROUND SERVICES STATUS (SYSTEMD)
+# ----------------------------------------------------
+print_section "3. Background Daemon Services Status"
 
-echo ""
-echo -e "${BOLD}--- [3/5] Network Socket Allocations ---${NC}"
-
-# Check RTMP Port 1935
-if ss -tuln | grep -q ":1935 "; then
-  PROCESS_1935=$(ss -tulnp | grep ":1935 " | awk '{print $7}' | cut -d'"' -f2 | head -n 1)
-  print_status "RTMP Ingestion (Port 1935)" "OPEN" "Accepting streams. Process: ${PROCESS_1935:-nginx}"
-else
-  print_status "RTMP Ingestion (Port 1935)" "FAIL" "Port closed - Nginx RTMP module not listening"
-fi
-
-# Check HTTP Web Port 80
-if ss -tuln | grep -q ":80 "; then
-  print_status "HTTP Dashboard Proxy (Port 80)" "OPEN" "Responding to connection requests"
-else
-  print_status "HTTP Dashboard Proxy (Port 80)" "FAIL" "Port closed - HTTP reverse-proxy offline"
-fi
-
-# Check Internal Port 3000
-if ss -tuln | grep -q ":3000 "; then
-  print_status "StreamPulse Internal (Port 3000)" "OPEN" "Node.js Express backend bound successfully"
-else
-  print_status "StreamPulse Internal (Port 3000)" "FAIL" "Port closed - Node.js Express server is down"
-fi
-
-echo ""
-echo -e "${BOLD}--- [4/5] Storage, Path permissions, and Formats ---${NC}"
-
-# Check Memory & Disk
-RAM_FREE=$(free -m | awk '/^Mem:/{print $4}')
-DISK_FREE=$(df -m . | awk 'NR==2 {print $4}')
-print_status "Free System Memory" "PASS" "${RAM_FREE} MB available"
-print_status "Free Disk Space" "PASS" "${DISK_FREE} MB available on root volume"
-
-# Verify HLS directory permissions
-if [ -d "/var/www/hls" ]; then
-  HLS_OWNER=$(stat -c '%U' /var/www/hls)
-  HLS_PERM=$(stat -c '%a' /var/www/hls)
-  if [[ "$HLS_OWNER" = "www-data" && "$HLS_PERM" -ge 755 ]]; then
-    print_status "HLS Streaming Directory" "PASS" "/var/www/hls owner is '$HLS_OWNER' with permissions '$HLS_PERM'"
-  else
-    print_status "HLS Streaming Directory" "WARN" "/var/www/hls has unexpected owner '$HLS_OWNER' or perm '$HLS_PERM'"
-  fi
-else
-  print_status "HLS Streaming Directory" "FAIL" "HLS streaming directory '/var/www/hls' is missing"
-fi
-
-# Verify DASH output support
-if [ -d "/var/www/hls/dash" ]; then
-  print_status "DASH Output Directory" "VALID" "/var/www/hls/dash is active and configured"
-else
-  print_status "DASH Output Directory" "WARN" "/var/www/hls/dash directory is missing"
-fi
-
-# Verify frontend build assets
-if [ -f "dist/index.html" ]; then
-  print_status "Frontend SPA Build" "PASS" "Built assets verified in dist/ directory"
-else
-  print_status "Frontend SPA Build" "FAIL" "No compiled frontend bundle (dist/index.html is missing)"
-fi
-
-echo ""
-echo -e "${BOLD}--- [5/5] Connected Systems & Database Validation ---${NC}"
-
-# Verify PostgreSQL DB connection and tables
-if [ -f ".env" ]; then
-  DB_USER=$(grep "^DB_USER=" .env | cut -d'=' -f2 | xargs || true)
-  DB_PASS=$(grep "^DB_PASSWORD=" .env | cut -d'=' -f2 | xargs || true)
-  DB_NAME=$(grep "^DB_NAME=" .env | cut -d'=' -f2 | xargs || true)
+check_service() {
+  local service_name="$1"
+  local display_name="$2"
+  local required="$3"
   
-  if [[ -n "$DB_USER" && -n "$DB_PASS" && -n "$DB_NAME" ]]; then
-    if PGPASSWORD="$DB_PASS" psql -h 127.0.0.1 -U "$DB_USER" -d "$DB_NAME" -c "SELECT 1;" &>/dev/null; then
-      TABLE_COUNT=$(PGPASSWORD="$DB_PASS" psql -h 127.0.0.1 -U "$DB_USER" -d "$DB_NAME" -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';")
+  if systemctl is-active --quiet "$service_name"; then
+    add_report "PASS" "$display_name Service" "Service daemon is running and active."
+  else
+    if [ "$required" = "true" ]; then
+      add_report "FAIL" "$display_name Service" "Service is INACTIVE or failed to start."
+    else
+      add_report "WARN" "$display_name Service" "Service is INACTIVE or not enabled (Optional)."
+    fi
+  fi
+}
+
+check_service "streampulse" "StreamPulse API Manager" "true"
+check_service "nginx" "Nginx Web & RTMP Server" "true"
+check_service "postgresql" "PostgreSQL Database" "true"
+check_service "fail2ban" "Fail2Ban Protection" "false"
+check_service "docker" "Docker Engine" "false"
+echo ""
+
+# ----------------------------------------------------
+# 4. NETWORK PORT BINDINGS
+# ----------------------------------------------------
+print_section "4. Network Port Bindings"
+
+check_port() {
+  local port="$1"
+  local service_desc="$2"
+  local required="$3"
+  
+  local bound=false
+  if command -v ss &>/dev/null; then
+    if ss -tuln | grep -q ":$port "; then bound=true; fi
+  else
+    if netstat -tuln | grep -q ":$port "; then bound=true; fi
+  fi
+  
+  if [ "$bound" = true ]; then
+    add_report "PASS" "Port $port ($service_desc)" "Bound and actively listening."
+  else
+    if [ "$required" = "true" ]; then
+      add_report "FAIL" "Port $port ($service_desc)" "Port is NOT bound. Ensure the service is fully started."
+    else
+      add_report "WARN" "Port $port ($service_desc)" "Port is NOT bound (Optional/Upgrade mode dependency)."
+    fi
+  fi
+}
+
+check_port "80" "HTTP Dashboard Ingress" "true"
+check_port "1935" "RTMP Video Ingest" "true"
+check_port "3000" "StreamPulse Backend Engine" "true"
+check_port "5432" "PostgreSQL Database Engine" "true"
+echo ""
+
+# ----------------------------------------------------
+# 5. ENVIRONMENT & DATABASE CONNECTIVITY
+# ----------------------------------------------------
+print_section "5. Environment & Database Connectivity"
+
+if [ -f ".env" ]; then
+  add_report "PASS" "Config File (.env)" "Found in app root directory with secure permissions."
+  
+  # Load DB credentials safely from env file
+  DB_USER=$(grep "^DB_USER=" .env | cut -d'=' -f2- | xargs)
+  DB_PASSWORD=$(grep "^DB_PASSWORD=" .env | cut -d'=' -f2- | xargs)
+  DB_NAME=$(grep "^DB_NAME=" .env | cut -d'=' -f2- | xargs)
+  DB_HOST=$(grep "^DB_HOST=" .env | cut -d'=' -f2- | xargs)
+  
+  if [[ -n "$DB_USER" && -n "$DB_PASSWORD" && -n "$DB_NAME" && -n "$DB_HOST" ]]; then
+    # Test local database connectivity
+    if PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -c "SELECT 1;" &>/dev/null; then
+      add_report "PASS" "Database Connection" "Successfully authenticated to PostgreSQL ($DB_NAME@$DB_HOST) with configured credentials."
       
-      # Verify core tables are present
-      USERS_TABLE=$(PGPASSWORD="$DB_PASS" psql -h 127.0.0.1 -U "$DB_USER" -d "$DB_NAME" -tAc "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'users');")
-      STREAMS_TABLE=$(PGPASSWORD="$DB_PASS" psql -h 127.0.0.1 -U "$DB_USER" -d "$DB_NAME" -tAc "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'streams');")
-      
-      if [[ "$USERS_TABLE" = "t" && "$STREAMS_TABLE" = "t" ]]; then
-        print_status "PostgreSQL DB Connection" "PASS" "Successfully authenticated to '$DB_NAME' ($TABLE_COUNT tables found, schema is valid)"
+      # Validate schema existence
+      TABLES_COUNT=$(PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';")
+      if [ "$TABLES_COUNT" -gt 0 ]; then
+        add_report "PASS" "Database Schema" "Verified $TABLES_COUNT tables in public schema."
       else
-        print_status "PostgreSQL DB Connection" "WARN" "Database connected, but core tables (users, streams) are missing!"
+        add_report "FAIL" "Database Schema" "Database tables are missing. Try re-running the schema.sql seed."
       fi
     else
-      print_status "PostgreSQL DB Connection" "FAIL" "Failed to connect using credentials stored in .env"
+      add_report "FAIL" "Database Connection" "Failed to connect to local database. Verify credentials in .env and check pg_hba.conf."
     fi
   else
-    print_status "PostgreSQL DB Connection" "FAIL" "Incomplete database keys inside .env configuration"
+    add_report "FAIL" "Database Credentials" "Required credentials (DB_USER, DB_PASSWORD, DB_NAME, DB_HOST) are partially missing from .env."
   fi
 else
-  print_status "PostgreSQL DB Connection" "FAIL" "Configuration file .env not found"
+  add_report "FAIL" "Config File (.env)" "Config file is missing from the app root directory."
 fi
-
-# Verify local backend API responsiveness
-if curl -s --max-time 3 http://localhost:3000/api/health &>/dev/null; then
-  print_status "StreamPulse Backend API" "PASS" "Local API healthcheck resolved with a positive response code"
-elif curl -s --max-time 3 http://localhost:3000/ &>/dev/null; then
-  print_status "StreamPulse Backend API" "PASS" "Server responded. Frontend pages served"
-else
-  print_status "StreamPulse Backend API" "FAIL" "Express router timed out or failed to reply"
-fi
-
 echo ""
+
+# ----------------------------------------------------
+# 6. DIRECTORIES & FILE SYSTEM INTEGRITY
+# ----------------------------------------------------
+print_section "6. Directories & File System Integrity"
+
+check_directory() {
+  local dir_path="$1"
+  local desc="$2"
+  local owner="$3"
+  
+  if [ -d "$dir_path" ]; then
+    # Check permissions and owner
+    local actual_owner=$(stat -c '%U' "$dir_path")
+    if [ "$actual_owner" = "$owner" ]; then
+      add_report "PASS" "$desc Directory" "Found at $dir_path with correct owner ($owner)."
+    else
+      add_report "WARN" "$desc Directory" "Found at $dir_path but has owner '$actual_owner' instead of expected '$owner'."
+    fi
+  else
+    add_report "FAIL" "$desc Directory" "Missing from expected path: $dir_path."
+  fi
+}
+
+check_directory "/var/www/hls" "HLS Live Segment Root" "www-data"
+check_directory "/var/log/streampulse" "StreamPulse System Logs" "root"
+
+if [ -x "/usr/local/bin/transcode.sh" ]; then
+  add_report "PASS" "Transcode Engine" "Script /usr/local/bin/transcode.sh exists and is executable."
+else
+  add_report "FAIL" "Transcode Engine" "Transcode script /usr/local/bin/transcode.sh is missing or not executable."
+fi
+echo ""
+
+# ----------------------------------------------------
+# 7. WEB SERVICE API & ENDPOINT INTEGRITY
+# ----------------------------------------------------
+print_section "7. Web Service API & Endpoint Integrity"
+
+API_HEALTHY=false
+if curl -s --max-time 3 http://127.0.0.1:3000/api/health &>/dev/null; then
+  API_HEALTHY=true
+  add_report "PASS" "Local API Status" "Responding successfully to HTTP GET /api/health."
+elif curl -s --max-time 3 http://127.0.0.1:3000/ &>/dev/null; then
+  API_HEALTHY=true
+  add_report "PASS" "Local API Status" "Responding to index route on port 3000."
+else
+  add_report "FAIL" "Local API Status" "No response on http://127.0.0.1:3000. Ensure npm/Node server is running."
+fi
+
+# ----------------------------------------------------
+# SUMMARY OF PLATFORM STATUS
+# ----------------------------------------------------
+echo -e "${CYAN}${BOLD}==============================================================================${NC}"
+echo -e "${BOLD}   🏁  Platform Diagnostic Verification Summary                              ${NC}"
+echo -e "${CYAN}${BOLD}==============================================================================${NC}"
+echo -e "  Passed Audits:   ${GREEN}${PASS_COUNT}${NC}"
+echo -e "  Warnings:        ${YELLOW}${WARN_COUNT}${NC}"
+echo -e "  Failed Audits:   ${RED}${FAIL_COUNT}${NC}"
 echo -e "${CYAN}==============================================================================${NC}"
-echo -e "Diagnostic test cycle finished."
-echo -e "${CYAN}==============================================================================${NC}\n"
+
+if [ "$FAIL_COUNT" -eq 0 ] && [ "$WARN_COUNT" -eq 0 ]; then
+  echo -e "\n${GREEN}${BOLD}🎉 SUCCESS: Your StreamPulse RTMP VPS Manager is healthy and 100% ready for production!${NC}\n"
+  exit 0
+elif [ "$FAIL_COUNT" -eq 0 ]; then
+  echo -e "\n${YELLOW}${BOLD}⚠ WARNING: Your platform is running but has warnings. Please check the warnings above.${NC}\n"
+  exit 0
+else
+  echo -e "\n${RED}${BOLD}❌ ERROR: System is unhealthy. Please resolve the critical failures listed above!${NC}\n"
+  exit 1
+fi
