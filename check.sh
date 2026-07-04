@@ -11,6 +11,12 @@ set -uo pipefail
 # Get the absolute path of the directory containing this script
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 
+# Resolve production directory if installed, otherwise use current directory
+ACTIVE_DIR="/opt/streampulse"
+if [ ! -d "$ACTIVE_DIR" ] || [ ! -f "$ACTIVE_DIR/.env" ]; then
+  ACTIVE_DIR="$SCRIPT_DIR"
+fi
+
 # Terminal colors for professional formatting
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -89,7 +95,7 @@ fi
 HLS_DIR="/var/www/hls"
 DISK_TARGET="$HLS_DIR"
 if [ ! -d "$DISK_TARGET" ]; then
-  DISK_TARGET="$SCRIPT_DIR"
+  DISK_TARGET="$ACTIVE_DIR"
 fi
 AVAILABLE_DISK_MB=$(df -m "$DISK_TARGET" | awk 'NR==2 {print $4}')
 if [ -n "$AVAILABLE_DISK_MB" ]; then
@@ -234,14 +240,14 @@ echo ""
 # ----------------------------------------------------
 print_section "5. Environment & Database Connectivity"
 
-if [ -f "$SCRIPT_DIR/.env" ]; then
+if [ -f "$ACTIVE_DIR/.env" ]; then
   add_report "PASS" "Config File (.env)" "Found at absolute path with secure configurations."
   
   # Load DB credentials safely from env file, stripping quotes
-  DB_USER=$(grep "^DB_USER=" "$SCRIPT_DIR/.env" | cut -d'=' -f2- | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
-  DB_PASSWORD=$(grep "^DB_PASSWORD=" "$SCRIPT_DIR/.env" | cut -d'=' -f2- | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
-  DB_NAME=$(grep "^DB_NAME=" "$SCRIPT_DIR/.env" | cut -d'=' -f2- | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
-  DB_HOST=$(grep "^DB_HOST=" "$SCRIPT_DIR/.env" | cut -d'=' -f2- | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+  DB_USER=$(grep "^DB_USER=" "$ACTIVE_DIR/.env" | cut -d'=' -f2- | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+  DB_PASSWORD=$(grep "^DB_PASSWORD=" "$ACTIVE_DIR/.env" | cut -d'=' -f2- | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+  DB_NAME=$(grep "^DB_NAME=" "$ACTIVE_DIR/.env" | cut -d'=' -f2- | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+  DB_HOST=$(grep "^DB_HOST=" "$ACTIVE_DIR/.env" | cut -d'=' -f2- | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
   
   if [[ -n "$DB_USER" && -n "$DB_PASSWORD" && -n "$DB_NAME" && -n "$DB_HOST" ]]; then
     # Test local database connectivity
@@ -262,7 +268,7 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
     add_report "FAIL" "Database Credentials" "Required credentials (DB_USER, DB_PASSWORD, DB_NAME, DB_HOST) are partially missing from .env."
   fi
 else
-  add_report "FAIL" "Config File (.env)" "Config file (.env) is missing from the app root directory $SCRIPT_DIR."
+  add_report "FAIL" "Config File (.env)" "Config file (.env) is missing from the active application directory $ACTIVE_DIR."
 fi
 echo ""
 
@@ -308,14 +314,18 @@ echo ""
 print_section "7. Web Service API & Endpoint Integrity"
 
 API_HEALTHY=false
-if curl -s --max-time 3 http://127.0.0.1:3000/api/health &>/dev/null; then
+HEALTH_RESP=$(curl -s --max-time 3 http://127.0.0.1:3000/health || echo "")
+if [[ "$HEALTH_RESP" == *"\"status\""*"\"ok\""* ]]; then
+  API_HEALTHY=true
+  add_report "PASS" "Local API Status" "Responding successfully to HTTP GET /health with status: ok"
+elif curl -s --max-time 3 http://127.0.0.1:3000/api/health &>/dev/null; then
   API_HEALTHY=true
   add_report "PASS" "Local API Status" "Responding successfully to HTTP GET /api/health."
 elif curl -s --max-time 3 http://127.0.0.1:3000/ &>/dev/null; then
   API_HEALTHY=true
   add_report "PASS" "Local API Status" "Responding to index route on port 3000."
 else
-  add_report "FAIL" "Local API Status" "No response on http://127.0.0.1:3000. Ensure npm/Node server is running."
+  add_report "FAIL" "Local API Status" "No response on http://127.0.0.1:3000/health. Ensure npm/Node server is running and listening on port 3000."
 fi
 
 # ----------------------------------------------------

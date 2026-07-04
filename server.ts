@@ -39,6 +39,16 @@ async function startServer() {
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
 
+  // Production health check endpoint
+  app.get('/health', (req, res) => {
+    res.json({ status: "ok" });
+  });
+
+  // Support /api/health as well
+  app.get('/api/health', (req, res) => {
+    res.json({ status: "ok" });
+  });
+
   // Serve HLS & DASH streams with proper CORS headers for player libraries
   const hlsPath = path.resolve('./data/hls');
   if (!fs.existsSync(hlsPath)) {

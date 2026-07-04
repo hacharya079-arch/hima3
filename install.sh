@@ -133,6 +133,21 @@ fi
 usermod -a -G www-data streampulse || true
 echo -e "${GREEN}[✔] System user streampulse verified.${NC}\n"
 
+# 3. PRODUCTION DEPLOYMENT PATH SETUP
+echo -e "[*] Preparing enterprise-grade production directory..."
+DEPLOY_DIR="/opt/streampulse"
+if [ "$SCRIPT_DIR" != "$DEPLOY_DIR" ]; then
+  echo -e "  - Deploying codebase to $DEPLOY_DIR..."
+  mkdir -p "$DEPLOY_DIR"
+  # Copy all files including hidden ones (like .env.example) to /opt/streampulse
+  cp -r "$SCRIPT_DIR"/. "$DEPLOY_DIR"/
+  # Change to the deployment directory to run subsequent steps
+  cd "$DEPLOY_DIR"
+  # Update SCRIPT_DIR so that the rest of the script registers and builds correctly
+  SCRIPT_DIR="$DEPLOY_DIR"
+fi
+echo -e "${GREEN}[✔] Production deployment directory set to $DEPLOY_DIR.${NC}\n"
+
 # CPU Architecture detection
 echo -e "[*] Detecting hardware architecture..."
 ARCH=$(uname -m)
@@ -806,7 +821,7 @@ echo -e "  - Configuring directory ownership and permissions for streampulse..."
 chown -R streampulse:streampulse "$SCRIPT_DIR"
 chown -R streampulse:streampulse /var/log/streampulse
 
-NPM_BIN_PATH=$(command -v npm || which npm || echo "/usr/bin/npm")
+NODE_BIN_PATH=$(command -v node || which node || echo "/usr/bin/node")
 
 cat << EOF > /etc/systemd/system/streampulse.service
 [Unit]
@@ -818,7 +833,7 @@ Type=simple
 User=streampulse
 Group=streampulse
 WorkingDirectory=$SCRIPT_DIR
-ExecStart=$NPM_BIN_PATH start
+ExecStart=$NODE_BIN_PATH dist/server.cjs
 Restart=always
 RestartSec=5
 Environment=NODE_ENV=production
@@ -845,7 +860,7 @@ echo -e "${BLUE}[*] Launching comprehensive platform diagnostic test validation.
 BACKEND_HEALTHY=false
 echo -e "  - Waiting for local StreamPulse API server response..."
 for i in {1..15}; do
-  if curl -s --max-time 3 http://127.0.0.1:3000/api/health &>/dev/null || curl -s --max-time 3 http://127.0.0.1:3000/ &>/dev/null; then
+  if curl -s --max-time 3 http://127.0.0.1:3000/health &>/dev/null || curl -s --max-time 3 http://127.0.0.1:3000/api/health &>/dev/null || curl -s --max-time 3 http://127.0.0.1:3000/ &>/dev/null; then
     BACKEND_HEALTHY=true
     break
   fi

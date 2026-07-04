@@ -147,6 +147,12 @@ if [ -d "/var/www/hls" ]; then
   echo -e "  [${GREEN}✔${NC}] HLS media paths deleted."
 fi
 
+# Resolve production directory if installed, otherwise use current directory
+ACTIVE_DIR="/opt/streampulse"
+if [ ! -d "$ACTIVE_DIR" ]; then
+  ACTIVE_DIR="$SCRIPT_DIR"
+fi
+
 # 4. PostgreSQL Purge (Optional)
 if [ "$PURGE_DB" = true ]; then
   echo -e "\n${BLUE}[*] Purging database schemas and admin roles from PostgreSQL...${NC}"
@@ -154,9 +160,9 @@ if [ "$PURGE_DB" = true ]; then
   # Read credentials from local .env if available, stripping quotes
   DB_USER=""
   DB_NAME=""
-  if [ -f "$SCRIPT_DIR/.env" ]; then
-    DB_USER=$(grep "^DB_USER=" "$SCRIPT_DIR/.env" | cut -d'=' -f2- | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
-    DB_NAME=$(grep "^DB_NAME=" "$SCRIPT_DIR/.env" | cut -d'=' -f2- | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+  if [ -f "$ACTIVE_DIR/.env" ]; then
+    DB_USER=$(grep "^DB_USER=" "$ACTIVE_DIR/.env" | cut -d'=' -f2- | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+    DB_NAME=$(grep "^DB_NAME=" "$ACTIVE_DIR/.env" | cut -d'=' -f2- | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
   fi
   
   DB_USER=${DB_USER:-"streampulse_admin"}
@@ -191,6 +197,12 @@ fi
 if [ -d "$SCRIPT_DIR/dist" ]; then
   echo -e "  - Cleaning compiled frontend build assets (dist)..."
   rm -rf "$SCRIPT_DIR/dist"
+fi
+
+# Clean production application directory if exists
+if [ -d "/opt/streampulse" ]; then
+  echo -e "  - Removing production application directory /opt/streampulse..."
+  rm -rf /opt/streampulse
 fi
 
 # 6. Remove dedicated Linux user streampulse if it exists
