@@ -2312,6 +2312,15 @@ segment3.ts
   }, 60000); // Check every minute
 
   // ----------------------------------------------------
+  // API 404 & GLOBAL ERROR HANDLERS
+  // ----------------------------------------------------
+  
+  // Specific catch-all for missing API endpoints (returns JSON 404 instead of SPA index.html)
+  app.all('/api/*all', (req, res) => {
+    res.status(404).json({ error: 'API endpoint not found' });
+  });
+
+  // ----------------------------------------------------
   // VITE DEV SERVER VS PRODUCTION SERVING
   // ----------------------------------------------------
   if (process.env.NODE_ENV !== 'production') {
@@ -2327,6 +2336,19 @@ segment3.ts
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
+
+  // Global Error Handler Middleware (placed at the end of the middleware stack)
+  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    console.error('[Global Error Handler] Caught unhandled error:', err);
+    if (res.headersSent) {
+      return next(err);
+    }
+    const statusCode = err.status || err.statusCode || 500;
+    res.status(statusCode).json({
+      error: err.message || 'Internal Server Error',
+      ...(process.env.NODE_ENV !== 'production' && { stack: err.stack })
+    });
+  });
 
   // WRAP EXPRESS APP IN HTTP SERVER FOR WEBSOCKET SUPPORT
   const httpServer = createServer(app);
