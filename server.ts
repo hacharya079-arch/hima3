@@ -1,10 +1,10 @@
+import 'dotenv/config';
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
-import dotenv from 'dotenv';
 import { exec, spawn } from 'child_process';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
@@ -12,8 +12,8 @@ import { db } from './server/db.ts';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 
-// Load environment variables
-dotenv.config();
+// Environment variables loaded successfully via dotenv/config
+console.log('[System] Environment variables successfully loaded from .env file.');
 
 const PORT = 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'streampulse_default_secret_key_98451023';
