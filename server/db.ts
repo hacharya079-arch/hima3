@@ -242,7 +242,22 @@ const { Pool } = pg;
 let pgPool: pg.Pool | null = null;
 let usePostgres = false;
 
-if (process.env.DB_HOST && process.env.DB_USER && process.env.DB_PASSWORD && process.env.DB_NAME) {
+const isProd = process.env.NODE_ENV === 'production';
+const hasAnyDbEnv = !!(process.env.DB_HOST || process.env.DB_USER || process.env.DB_PASSWORD || process.env.DB_NAME);
+
+if (isProd || hasAnyDbEnv) {
+  // Validate that all required db configurations are set
+  if (!process.env.DB_HOST || !process.env.DB_USER || !process.env.DB_PASSWORD || !process.env.DB_NAME) {
+    const missing = [];
+    if (!process.env.DB_HOST) missing.push('DB_HOST');
+    if (!process.env.DB_USER) missing.push('DB_USER');
+    if (!process.env.DB_PASSWORD) missing.push('DB_PASSWORD');
+    if (!process.env.DB_NAME) missing.push('DB_NAME');
+    const errMsg = `CRITICAL: PostgreSQL configuration is expected but incomplete. Missing environment variables: ${missing.join(', ')}`;
+    console.error(errMsg);
+    throw new Error(errMsg);
+  }
+
   try {
     pgPool = new Pool({
       host: process.env.DB_HOST,
@@ -250,18 +265,24 @@ if (process.env.DB_HOST && process.env.DB_USER && process.env.DB_PASSWORD && pro
       user: process.env.DB_USER,
       password: process.env.DB_PASSWORD,
       database: process.env.DB_NAME,
-      max: 10,
+      max: 15,
       idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 2000,
+      connectionTimeoutMillis: 5000,
     });
+
+    // Manage pool error event listener to support seamless reconnect handling
+    pgPool.on('error', (err) => {
+      console.error('[PostgreSQL Pool Error] Unexpected idle client error:', err);
+    });
+
     usePostgres = true;
-    console.log('PostgreSQL configuration found. Running database initializer...');
+    console.log('PostgreSQL configuration successfully loaded. Connection pool initialized.');
   } catch (err) {
-    console.error('Failed to configure PostgreSQL pool, falling back to JSON storage.', err);
-    usePostgres = false;
+    console.error('CRITICAL: Failed to create PostgreSQL connection pool:', err);
+    throw err;
   }
 } else {
-  console.log('PostgreSQL env variables not set. Using secure local file-system persistence (data/db.json).');
+  console.log('Running in local/dev fallback mode. PostgreSQL variables not set. Using secure local file-system persistence (data/db.json).');
 }
 
 // Database helper functions supporting both real Postgres and persistent JSON Fallback
@@ -424,8 +445,15 @@ export const db = {
         client.release();
       }
     } catch (err) {
-      console.error('Error initializing PostgreSQL database, switching to file fallback:', err);
-      usePostgres = false;
+      const isProd = process.env.NODE_ENV === 'production';
+      const hasAnyDbEnv = !!(process.env.DB_HOST || process.env.DB_USER || process.env.DB_PASSWORD || process.env.DB_NAME);
+      if (isProd || hasAnyDbEnv) {
+        console.error('CRITICAL DATABASE ERROR: PostgreSQL initialization failed in production/configured mode.', err);
+        throw err;
+      } else {
+        console.warn('Error initializing PostgreSQL database, switching to local file fallback:', err);
+        usePostgres = false;
+      }
     }
   },
 
@@ -1426,6 +1454,13 @@ export const db = {
       return true;
     }
     return false;
+  },
+
+  close: async (): Promise<void> => {
+    if (pgPool) {
+      await pgPool.end();
+      console.log('[PostgreSQL] Database connection pool successfully closed.');
+    }
   }
 
 };

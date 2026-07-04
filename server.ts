@@ -2323,7 +2323,7 @@ segment3.ts
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
+    app.get('*all', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
@@ -2461,8 +2461,65 @@ segment3.ts
     }
   });
 
+  // Graceful shutdown handling
+  const gracefulShutdown = async (signal: string) => {
+    console.log(`\n[Shutdown] Received ${signal}. Initiating structured production shutdown...`);
+    
+    // Close WebSocket Server
+    try {
+      wss.close(() => {
+        console.log('[Shutdown] WebSocket Server successfully closed.');
+      });
+    } catch (err) {
+      console.error('[Shutdown] Error closing WebSocket Server:', err);
+    }
+
+    // Close HTTP Server
+    httpServer.close(async () => {
+      console.log('[Shutdown] HTTP Server successfully closed.');
+      
+      // Stop all active stream ingests and kill FFmpeg child processes
+      console.log('[Shutdown] Terminating active transcoding subprocesses...');
+      for (const [key, proc] of activeFfProcesses.entries()) {
+        try {
+          proc.kill('SIGTERM');
+          console.log(`[Shutdown] Terminated tracked FFmpeg process for key: ${key}`);
+        } catch (err) {
+          console.error(`[Shutdown] Error killing FFmpeg process for key ${key}:`, err);
+        }
+      }
+
+      // Close DB Connection Pool if PostgreSQL
+      try {
+        await db.close();
+      } catch (err) {
+        console.error('[Shutdown] Error closing database connection pool:', err);
+      }
+
+      console.log('[Shutdown] StreamPulse successfully decommissioned. Exiting process.');
+      process.exit(0);
+    });
+
+    // Force exit after 8 seconds if graceful shutdown gets stuck
+    setTimeout(() => {
+      console.error('[Shutdown] Graceful shutdown timed out. Forcefully exiting.');
+      process.exit(1);
+    }, 8000);
+  };
+
+  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+  process.on('uncaughtException', (err) => {
+    console.error('[CRITICAL ERROR] Uncaught Exception detected in runtime:', err);
+  });
+
+  process.on('unhandledRejection', (reason, promise) => {
+    console.error('[CRITICAL ERROR] Unhandled Rejection at Promise:', promise, 'reason:', reason);
+  });
+
   httpServer.listen(PORT, '0.0.0.0', () => {
-    console.log(`StreamPulse VPS Core listening on http://localhost:${PORT}`);
+    console.log(`[Production Startup] StreamPulse VPS Core listening on http://0.0.0.0:${PORT}`);
   });
 }
 
