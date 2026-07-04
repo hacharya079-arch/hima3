@@ -9,6 +9,10 @@
 # Exit immediately if a command exits with a non-zero status
 set -e
 
+# Get the absolute path of the directory containing this script
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+cd "$SCRIPT_DIR"
+
 # Setup logging directories and files
 LOG_DIR="/var/log/streampulse"
 mkdir -p "$LOG_DIR"
@@ -116,6 +120,19 @@ else
   exit 1
 fi
 
+# Ensure dedicated system user streampulse exists
+echo -e "[*] Ensuring streampulse system user exists..."
+if ! id "streampulse" &>/dev/null; then
+  echo -e "  - Creating system user 'streampulse'..."
+  useradd -r -m -s /usr/sbin/nologin streampulse
+  register_rollback "echo 'Removing created user streampulse...'; userdel -r streampulse || userdel streampulse || true"
+else
+  echo -e "  - System user 'streampulse' already exists."
+fi
+# Add streampulse to www-data group so they can share HLS segment paths seamlessly
+usermod -a -G www-data streampulse || true
+echo -e "${GREEN}[✔] System user streampulse verified.${NC}\n"
+
 # CPU Architecture detection
 echo -e "[*] Detecting hardware architecture..."
 ARCH=$(uname -m)
@@ -166,7 +183,7 @@ fi
 # Existing installation detection (Upgrade vs Fresh Install)
 echo -e "[*] Detecting existing StreamPulse installation..."
 UPGRADE_MODE=false
-if [ -f ".env" ] || systemctl list-units --full -all | grep -Fq "streampulse.service" || [ -d "/var/www/hls" ]; then
+if [ -f "$SCRIPT_DIR/.env" ] || systemctl list-units --full -all | grep -Fq "streampulse.service" || [ -d "/var/www/hls" ]; then
   UPGRADE_MODE=true
   echo -e "  - ${GREEN}An existing installation was detected.${NC}"
   echo -e "  - System will run in ${BOLD}UPGRADE / RE-INSTALL MODE${NC}."
@@ -218,7 +235,7 @@ echo -e "${GREEN}[✔] Port validation completed.${NC}\n"
 
 # 3. FILE INTEGRITY VALIDATION
 echo -e "[*] Validating integrity of repository files before configuration..."
-REQUIRED_FILES=(".env.example" "package.json" "server.ts" "vps-deployment/schema.sql" "vps-deployment/transcode.sh" "vps-deployment/nginx.conf" "vps-deployment/nginx-rtmp.conf")
+REQUIRED_FILES=("$SCRIPT_DIR/.env.example" "$SCRIPT_DIR/package.json" "$SCRIPT_DIR/server.ts" "$SCRIPT_DIR/vps-deployment/schema.sql" "$SCRIPT_DIR/vps-deployment/transcode.sh" "$SCRIPT_DIR/vps-deployment/nginx.conf" "$SCRIPT_DIR/vps-deployment/nginx-rtmp.conf")
 for file in "${REQUIRED_FILES[@]}"; do
   if [ ! -f "$file" ]; then
     echo -e "${RED}[- ] Error: Required installer file '$file' is missing!${NC}" >&2
@@ -268,8 +285,12 @@ fi
 # 7. INSTALL NODE.JS & NPM (Node 20 LTS)
 echo -e "${BLUE}[3/13] Validating Node.js runtime presence...${NC}"
 if ! command -v node &>/dev/null; then
-  echo -e "  - Node.js missing. Setting up NodeSource Node.js 20.x distribution..."
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  echo -e "  - Node.js missing. Setting up NodeSource Node.js 20.x repository..."
+  mkdir -p /etc/apt/keyrings
+  rm -f /etc/apt/keyrings/nodesource.gpg
+  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list
+  apt-get update
   echo -e "  - Installing Node.js..."
   apt-get install -y nodejs
 else
@@ -277,7 +298,11 @@ else
   NODE_VER=$(node -v | cut -d'v' -f2 | cut -d'.' -f1)
   if [ "$NODE_VER" -lt 18 ]; then
     echo -e "  - Current Node.js version $(node -v) is too low. Upgrading to v20 LTS..."
-    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+    mkdir -p /etc/apt/keyrings
+    rm -f /etc/apt/keyrings/nodesource.gpg
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list
+    apt-get update
     apt-get install -y nodejs
   else
     echo -e "  - ${GREEN}Node.js${NC} version meets prerequisites ($(node -v)). Skipping."
@@ -349,8 +374,8 @@ get_or_generate_env_var() {
   local var_name="$1"
   local bytes_len="$2"
   
-  if [ -f ".env" ] && grep -q "^${var_name}=" .env; then
-    local existing_val=$(grep "^${var_name}=" .env | cut -d'=' -f2- | xargs)
+  if [ -f "$SCRIPT_DIR/.env" ] && grep -q "^${var_name}=" "$SCRIPT_DIR/.env"; then
+    local existing_val=$(grep "^${var_name}=" "$SCRIPT_DIR/.env" | cut -d'=' -f2- | xargs)
     if [ -n "$existing_val" ]; then
       echo "$existing_val"
       return
@@ -360,12 +385,12 @@ get_or_generate_env_var() {
 }
 
 # If .env already exists, backup before making any changes (Never overwrite user data unless verified)
-if [ -f ".env" ]; then
+if [ -f "$SCRIPT_DIR/.env" ]; then
   echo -e "  - Existing .env file found. Preserving current configuration..."
-  BACKUP_ENV=".env.bak.$(date +%Y%m%d%H%M%S)"
-  cp .env "$BACKUP_ENV"
+  BACKUP_ENV="$SCRIPT_DIR/.env.bak.$(date +%Y%m%d%H%M%S)"
+  cp "$SCRIPT_DIR/.env" "$BACKUP_ENV"
   echo -e "  - Existing configuration backed up to ${CYAN}$BACKUP_ENV${NC}"
-  register_rollback "echo 'Restoring original .env configuration...'; cp -f $BACKUP_ENV .env"
+  register_rollback "echo 'Restoring original .env configuration...'; cp -f $BACKUP_ENV $SCRIPT_DIR/.env"
   
   # Retrieve or securely generate values
   DB_RAND_USER=$(get_or_generate_env_var "DB_USER" 0)
@@ -382,16 +407,16 @@ if [ -f ".env" ]; then
   RAND_SESSION_SECRET=$(get_or_generate_env_var "SESSION_SECRET" 32)
   
   # Ensure all variables are written back properly
-  sed -i "s|^DB_USER=.*|DB_USER=${DB_RAND_USER}|g" .env || echo "DB_USER=${DB_RAND_USER}" >> .env
-  sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${DB_RAND_PASS}|g" .env || echo "DB_PASSWORD=${DB_RAND_PASS}" >> .env
-  sed -i "s|^DB_NAME=.*|DB_NAME=${DB_RAND_NAME}|g" .env || echo "DB_NAME=${DB_RAND_NAME}" >> .env
-  sed -i "s|^DB_HOST=.*|DB_HOST=${DB_RAND_HOST}|g" .env || echo "DB_HOST=${DB_RAND_HOST}" >> .env
-  sed -i "s|^JWT_SECRET=.*|JWT_SECRET=${RAND_JWT_SECRET}|g" .env || echo "JWT_SECRET=${RAND_JWT_SECRET}" >> .env
-  sed -i "s|^SESSION_SECRET=.*|SESSION_SECRET=${RAND_SESSION_SECRET}|g" .env || echo "SESSION_SECRET=${RAND_SESSION_SECRET}" >> .env
+  sed -i "s|^DB_USER=.*|DB_USER=${DB_RAND_USER}|g" "$SCRIPT_DIR/.env" || echo "DB_USER=${DB_RAND_USER}" >> "$SCRIPT_DIR/.env"
+  sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${DB_RAND_PASS}|g" "$SCRIPT_DIR/.env" || echo "DB_PASSWORD=${DB_RAND_PASS}" >> "$SCRIPT_DIR/.env"
+  sed -i "s|^DB_NAME=.*|DB_NAME=${DB_RAND_NAME}|g" "$SCRIPT_DIR/.env" || echo "DB_NAME=${DB_RAND_NAME}" >> "$SCRIPT_DIR/.env"
+  sed -i "s|^DB_HOST=.*|DB_HOST=${DB_RAND_HOST}|g" "$SCRIPT_DIR/.env" || echo "DB_HOST=${DB_RAND_HOST}" >> "$SCRIPT_DIR/.env"
+  sed -i "s|^JWT_SECRET=.*|JWT_SECRET=${RAND_JWT_SECRET}|g" "$SCRIPT_DIR/.env" || echo "JWT_SECRET=${RAND_JWT_SECRET}" >> "$SCRIPT_DIR/.env"
+  sed -i "s|^SESSION_SECRET=.*|SESSION_SECRET=${RAND_SESSION_SECRET}|g" "$SCRIPT_DIR/.env" || echo "SESSION_SECRET=${RAND_SESSION_SECRET}" >> "$SCRIPT_DIR/.env"
 else
   echo -e "  - Creating new secure production environment .env file..."
-  cp .env.example .env
-  chmod 600 .env
+  cp "$SCRIPT_DIR/.env.example" "$SCRIPT_DIR/.env"
+  chmod 600 "$SCRIPT_DIR/.env"
   
   DB_RAND_USER="streampulse_admin"
   DB_RAND_PASS=$(openssl rand -hex 18)
@@ -400,26 +425,26 @@ else
   RAND_JWT_SECRET=$(openssl rand -hex 32)
   RAND_SESSION_SECRET=$(openssl rand -hex 32)
   
-  sed -i "s|^DB_USER=.*|DB_USER=${DB_RAND_USER}|g" .env
-  sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${DB_RAND_PASS}|g" .env
-  sed -i "s|^DB_NAME=.*|DB_NAME=${DB_RAND_NAME}|g" .env
-  sed -i "s|^DB_HOST=.*|DB_HOST=${DB_RAND_HOST}|g" .env
-  sed -i "s|^JWT_SECRET=.*|JWT_SECRET=${RAND_JWT_SECRET}|g" .env
+  sed -i "s|^DB_USER=.*|DB_USER=${DB_RAND_USER}|g" "$SCRIPT_DIR/.env"
+  sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${DB_RAND_PASS}|g" "$SCRIPT_DIR/.env"
+  sed -i "s|^DB_NAME=.*|DB_NAME=${DB_RAND_NAME}|g" "$SCRIPT_DIR/.env"
+  sed -i "s|^DB_HOST=.*|DB_HOST=${DB_RAND_HOST}|g" "$SCRIPT_DIR/.env"
+  sed -i "s|^JWT_SECRET=.*|JWT_SECRET=${RAND_JWT_SECRET}|g" "$SCRIPT_DIR/.env"
   
-  if grep -q "SESSION_SECRET" .env; then
-    sed -i "s|^SESSION_SECRET=.*|SESSION_SECRET=${RAND_SESSION_SECRET}|g" .env
+  if grep -q "SESSION_SECRET" "$SCRIPT_DIR/.env"; then
+    sed -i "s|^SESSION_SECRET=.*|SESSION_SECRET=${RAND_SESSION_SECRET}|g" "$SCRIPT_DIR/.env"
   else
-    echo "SESSION_SECRET=${RAND_SESSION_SECRET}" >> .env
+    echo "SESSION_SECRET=${RAND_SESSION_SECRET}" >> "$SCRIPT_DIR/.env"
   fi
 fi
 
 # Set secure permissions
-chmod 600 .env
+chmod 600 "$SCRIPT_DIR/.env"
 
 # Validate .env contents
 echo -e "  - Validating required environment variables..."
 for var in DB_USER DB_PASSWORD DB_NAME DB_HOST JWT_SECRET SESSION_SECRET; do
-  val=$(grep "^${var}=" .env | cut -d'=' -f2- | xargs)
+  val=$(grep "^${var}=" "$SCRIPT_DIR/.env" | cut -d'=' -f2- | xargs)
   if [ -z "$val" ]; then
     echo -e "${RED}[- ] Error: Required configuration variable $var is missing or empty in .env!${NC}" >&2
     exit 1
@@ -434,12 +459,12 @@ echo -e "${BLUE}[7/13] Configuring database schema and user privilege scopes...$
 echo -e "  - Ensuring PostgreSQL database user exists..."
 USER_CHECK=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DB_RAND_USER}'")
 if [ "$USER_CHECK" != "1" ]; then
-  sudo -u postgres psql -c "CREATE USER ${DB_RAND_USER} WITH PASSWORD '${DB_RAND_PASS}' SUPERUSER;"
+  sudo -u postgres psql -c "CREATE USER ${DB_RAND_USER} WITH PASSWORD '${DB_RAND_PASS}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;"
   echo -e "    - User role '${DB_RAND_USER}' created."
 else
-  # Sync password for existing user
-  sudo -u postgres psql -c "ALTER USER ${DB_RAND_USER} WITH PASSWORD '${DB_RAND_PASS}';"
-  echo -e "    - User role '${DB_RAND_USER}' password updated."
+  # Sync password for existing user and strip SUPERUSER privilege if present
+  sudo -u postgres psql -c "ALTER USER ${DB_RAND_USER} WITH PASSWORD '${DB_RAND_PASS}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;"
+  echo -e "    - User role '${DB_RAND_USER}' password updated and privileges hardened."
 fi
 
 # Setup DB Database
@@ -447,10 +472,16 @@ echo -e "  - Ensuring PostgreSQL database exists..."
 DB_CHECK=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_RAND_NAME}'")
 if [ "$DB_CHECK" != "1" ]; then
   sudo -u postgres psql -c "CREATE DATABASE ${DB_RAND_NAME} OWNER ${DB_RAND_USER};"
-  echo -e "    - Database '${DB_RAND_NAME}' created."
+  echo -e "    - Database '${DB_RAND_NAME}' created with owner ${DB_RAND_USER}."
 else
-  echo -e "    - Database '${DB_RAND_NAME}' already exists."
+  # Ensure the user has owner privileges even if database already existed
+  sudo -u postgres psql -c "ALTER DATABASE ${DB_RAND_NAME} OWNER TO ${DB_RAND_USER};"
+  echo -e "    - Database '${DB_RAND_NAME}' already exists. Database ownership verified."
 fi
+
+# Explicitly grant all privileges on database and schema public to the user
+sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE ${DB_RAND_NAME} TO ${DB_RAND_USER};"
+sudo -u postgres psql -d "${DB_RAND_NAME}" -c "GRANT ALL ON SCHEMA public TO ${DB_RAND_USER};"
 
 # Setup rollback actions for database elements on fresh installation failure
 if [ "$UPGRADE_MODE" = "false" ]; then
@@ -493,7 +524,7 @@ fi
 
 # Seeding database schemas from vps-deployment/schema.sql
 echo -e "  - Importing database schema from vps-deployment/schema.sql..."
-if PGPASSWORD="$DB_RAND_PASS" psql -h 127.0.0.1 -U "$DB_RAND_USER" -d "$DB_RAND_NAME" -f ./vps-deployment/schema.sql >/dev/null; then
+if PGPASSWORD="$DB_RAND_PASS" psql -h 127.0.0.1 -U "$DB_RAND_USER" -d "$DB_RAND_NAME" -f "$SCRIPT_DIR/vps-deployment/schema.sql" >/dev/null; then
   echo -e "${GREEN}[✔] Database fully seeded and optimized.${NC}\n"
 else
   echo -e "${RED}[- ] Error: Schema database seeding failed!${NC}" >&2
@@ -538,7 +569,7 @@ fi
 
 # Configure Transcode Script
 echo -e "  - Configuring stream profile transcoder launch script..."
-cp -f ./vps-deployment/transcode.sh /usr/local/bin/transcode.sh
+cp -f "$SCRIPT_DIR/vps-deployment/transcode.sh" /usr/local/bin/transcode.sh
 chmod +x /usr/local/bin/transcode.sh
 
 # Directory structure setup for HLS & DASH (Preserve media if upgrading)
@@ -716,24 +747,23 @@ cat << 'EOF' > /etc/logrotate.d/streampulse
     delaycompress
     missingok
     notifempty
-    create 0640 root root
+    create 0640 streampulse streampulse
 }
 EOF
 echo -e "${GREEN}[✔] Log rotation policy established.${NC}\n"
 
 # Configure Automated Backups Cron Job
 echo -e "[*] Scheduling automatic daily backups..."
-APP_DIR=$(pwd)
 cat << EOF > /etc/cron.daily/streampulse-backup
 #!/bin/bash
 BACKUP_DIR="/var/backups/streampulse"
 mkdir -p "\$BACKUP_DIR"
 DATE=\$(date +%F_%H%M%S)
 
-if [ -f "${APP_DIR}/.env" ]; then
-  DB_USER=\$(grep "^DB_USER=" "${APP_DIR}/.env" | cut -d'=' -f2 | xargs)
-  DB_PASSWORD=\$(grep "^DB_PASSWORD=" "${APP_DIR}/.env" | cut -d'=' -f2 | xargs)
-  DB_NAME=\$(grep "^DB_NAME=" "${APP_DIR}/.env" | cut -d'=' -f2 | xargs)
+if [ -f "$SCRIPT_DIR/.env" ]; then
+  DB_USER=\$(grep "^DB_USER=" "$SCRIPT_DIR/.env" | cut -d'=' -f2 | xargs | sed -e 's/^"//' -e 's/"\$//' -e "s/^'//" -e "s/'\$//")
+  DB_PASSWORD=\$(grep "^DB_PASSWORD=" "$SCRIPT_DIR/.env" | cut -d'=' -f2 | xargs | sed -e 's/^"//' -e 's/"\$//' -e "s/^'//" -e "s/'\$//")
+  DB_NAME=\$(grep "^DB_NAME=" "$SCRIPT_DIR/.env" | cut -d'=' -f2 | xargs | sed -e 's/^"//' -e 's/"\$//' -e "s/^'//" -e "s/'\$//")
   
   if [[ -n "\$DB_USER" && -n "\$DB_PASSWORD" && -n "\$DB_NAME" ]]; then
     PGPASSWORD="\$DB_PASSWORD" pg_dump -h 127.0.0.1 -U "\$DB_USER" -d "\$DB_NAME" -F c -b -f "\$BACKUP_DIR/db_\${DB_NAME}_\${DATE}.backup" >/dev/null 2>&1
@@ -770,7 +800,14 @@ fi
 
 # 17. SYSTEMD BACKGROUND DAEMON REGISTRATION
 echo -e "${BLUE}[13/13] Registering StreamPulse as a background systemd service daemon...${NC}"
-APP_DIR=$(pwd)
+
+# Configure secure ownership of workspace and log directory before registering the service
+echo -e "  - Configuring directory ownership and permissions for streampulse..."
+chown -R streampulse:streampulse "$SCRIPT_DIR"
+chown -R streampulse:streampulse /var/log/streampulse
+
+NPM_BIN_PATH=$(command -v npm || which npm || echo "/usr/bin/npm")
+
 cat << EOF > /etc/systemd/system/streampulse.service
 [Unit]
 Description=StreamPulse RTMP VPS Manager Service
@@ -778,9 +815,10 @@ After=network.target postgresql.service nginx.service
 
 [Service]
 Type=simple
-User=root
-WorkingDirectory=${APP_DIR}
-ExecStart=/usr/bin/npm start
+User=streampulse
+Group=streampulse
+WorkingDirectory=$SCRIPT_DIR
+ExecStart=$NPM_BIN_PATH start
 Restart=always
 RestartSec=5
 Environment=NODE_ENV=production
@@ -825,7 +863,7 @@ fi
 trap - EXIT
 
 # Execute diagnostic suite to perform remaining tests
-./check.sh
+"$SCRIPT_DIR"/check.sh
 
 echo -e "${GREEN}${BOLD}==============================================================================${NC}"
 echo -e "${GREEN}${BOLD}   🏁  StreamPulse Installation Completed Successfully!                      ${NC}"

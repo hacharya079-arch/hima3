@@ -17,9 +17,10 @@ fi
 # Ensure output path exists
 mkdir -p "${HLS_PATH}"
 
-# Run FFmpeg transcoding in background to achieve low latency
+# Run FFmpeg transcoding in foreground replacing the shell process
+# This allows Nginx RTMP to monitor the process and terminate it when publishers disconnect
 # Generates 1080p, 720p, 480p, and 360p streams with unified HLS master playlist
-ffmpeg -i "${RTMP_INPUT}" \
+exec ffmpeg -i "${RTMP_INPUT}" \
   -filter_complex "[v:0]split=4[v1080][v720][v480][v360]" \
   \
   -map "[v1080]" -c:v:0 libx264 -preset veryfast -b:v:0 6000k -maxrate:v:0 6000k -bufsize:v:0 12000k -g 60 -keyint_min 60 -sc_threshold 0 \
@@ -38,6 +39,4 @@ ffmpeg -i "${RTMP_INPUT}" \
   -master_pl_name master.m3u8 \
   -hls_segment_filename "${HLS_PATH}/v%v/file%03d.ts" \
   -var_stream_map "v:0,a:0 v:1,a:1 v:2,a:2 v:3,a:3" \
-  "${HLS_PATH}/v%v/index.m3u8" > /var/log/nginx/transcode_${STREAM_KEY}.log 2>&1 &
-
-echo "Transcoding process initialized for stream ${STREAM_KEY} in background."
+  "${HLS_PATH}/v%v/index.m3u8" > /var/log/nginx/transcode_${STREAM_KEY}.log 2>&1

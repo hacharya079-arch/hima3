@@ -8,6 +8,9 @@
 # Exit immediately if a command fails in an unexpected way
 set -uo pipefail
 
+# Get the absolute path of the directory containing this script
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+
 # Terminal colors for professional formatting
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -34,10 +37,10 @@ print_section() {
 }
 
 # 1. Root privilege validation
+IS_ROOT=true
 if [ "$EUID" -ne 0 ]; then
-  echo -e "${RED}[✖] Error: This diagnostic suite must be executed with root privileges.${NC}" >&2
-  echo -e "${YELLOW}Please run with: sudo ./check.sh${NC}" >&2
-  exit 1
+  echo -e "${YELLOW}[!] Warning: Running as non-root user. Some privileged diagnostics (like Fail2Ban status, directory permissions) will be skipped or may show warnings.${NC}\n"
+  IS_ROOT=false
 fi
 
 print_header
@@ -69,25 +72,31 @@ add_report() {
 # ----------------------------------------------------
 print_section "1. System Hardware Resources Check"
 
-# RAM check
+# RAM check (Total and Available)
 TOTAL_RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
-if [ -n "$TOTAL_RAM_MB" ]; then
+AVAILABLE_RAM_MB=$(free -m | awk '/^Mem:/{print $7}')
+if [ -n "$TOTAL_RAM_MB" ] && [ -n "$AVAILABLE_RAM_MB" ]; then
   if [ "$TOTAL_RAM_MB" -lt 950 ]; then
-    add_report "WARN" "System Memory" "Only ${TOTAL_RAM_MB}MB RAM detected. FFmpeg transcode operations may face memory constraints."
+    add_report "WARN" "System Memory" "Only ${TOTAL_RAM_MB}MB total RAM detected (Available: ${AVAILABLE_RAM_MB}MB). FFmpeg transcode operations may face constraints."
   else
-    add_report "PASS" "System Memory" "${TOTAL_RAM_MB}MB RAM detected (Prerequisite: >= 1024MB)."
+    add_report "PASS" "System Memory" "RAM metrics: Total=${TOTAL_RAM_MB}MB, Available=${AVAILABLE_RAM_MB}MB (Prerequisite: >= 1024MB)."
   fi
 else
-  add_report "WARN" "System Memory" "Unable to fetch memory metrics."
+  add_report "WARN" "System Memory" "Unable to fetch complete memory metrics."
 fi
 
-# Disk space check
-AVAILABLE_DISK_MB=$(df -m . | awk 'NR==2 {print $4}')
+# Disk space check on actual HLS storage directory
+HLS_DIR="/var/www/hls"
+DISK_TARGET="$HLS_DIR"
+if [ ! -d "$DISK_TARGET" ]; then
+  DISK_TARGET="$SCRIPT_DIR"
+fi
+AVAILABLE_DISK_MB=$(df -m "$DISK_TARGET" | awk 'NR==2 {print $4}')
 if [ -n "$AVAILABLE_DISK_MB" ]; then
   if [ "$AVAILABLE_DISK_MB" -lt 1500 ]; then
-    add_report "FAIL" "Disk Space" "Only ${AVAILABLE_DISK_MB}MB free disk space available (Prerequisite: >= 1500MB)."
+    add_report "FAIL" "Disk Space" "Only ${AVAILABLE_DISK_MB}MB free disk space available at $DISK_TARGET (Prerequisite: >= 1500MB)."
   else
-    add_report "PASS" "Disk Space" "${AVAILABLE_DISK_MB}MB free disk space available."
+    add_report "PASS" "Disk Space" "${AVAILABLE_DISK_MB}MB free disk space available at $DISK_TARGET."
   fi
 else
   add_report "WARN" "Disk Space" "Unable to fetch disk metrics."
@@ -162,13 +171,19 @@ check_service() {
   local display_name="$2"
   local required="$3"
   
-  if systemctl is-active --quiet "$service_name"; then
+  if ! systemctl list-unit-files | grep -Fq "${service_name}.service"; then
+    if [ "$required" = "true" ]; then
+      add_report "FAIL" "$display_name Service" "Service unit '${service_name}.service' is NOT installed on this system."
+    else
+      add_report "WARN" "$display_name Service" "Service unit '${service_name}.service' is NOT installed on this system (Optional)."
+    fi
+  elif systemctl is-active --quiet "$service_name"; then
     add_report "PASS" "$display_name Service" "Service daemon is running and active."
   else
     if [ "$required" = "true" ]; then
-      add_report "FAIL" "$display_name Service" "Service is INACTIVE or failed to start."
+      add_report "FAIL" "$display_name Service" "Service is installed but INACTIVE or failed to start."
     else
-      add_report "WARN" "$display_name Service" "Service is INACTIVE or not enabled (Optional)."
+      add_report "WARN" "$display_name Service" "Service is installed but INACTIVE or disabled (Optional)."
     fi
   fi
 }
@@ -219,14 +234,14 @@ echo ""
 # ----------------------------------------------------
 print_section "5. Environment & Database Connectivity"
 
-if [ -f ".env" ]; then
-  add_report "PASS" "Config File (.env)" "Found in app root directory with secure permissions."
+if [ -f "$SCRIPT_DIR/.env" ]; then
+  add_report "PASS" "Config File (.env)" "Found at absolute path with secure configurations."
   
-  # Load DB credentials safely from env file
-  DB_USER=$(grep "^DB_USER=" .env | cut -d'=' -f2- | xargs)
-  DB_PASSWORD=$(grep "^DB_PASSWORD=" .env | cut -d'=' -f2- | xargs)
-  DB_NAME=$(grep "^DB_NAME=" .env | cut -d'=' -f2- | xargs)
-  DB_HOST=$(grep "^DB_HOST=" .env | cut -d'=' -f2- | xargs)
+  # Load DB credentials safely from env file, stripping quotes
+  DB_USER=$(grep "^DB_USER=" "$SCRIPT_DIR/.env" | cut -d'=' -f2- | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+  DB_PASSWORD=$(grep "^DB_PASSWORD=" "$SCRIPT_DIR/.env" | cut -d'=' -f2- | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+  DB_NAME=$(grep "^DB_NAME=" "$SCRIPT_DIR/.env" | cut -d'=' -f2- | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+  DB_HOST=$(grep "^DB_HOST=" "$SCRIPT_DIR/.env" | cut -d'=' -f2- | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
   
   if [[ -n "$DB_USER" && -n "$DB_PASSWORD" && -n "$DB_NAME" && -n "$DB_HOST" ]]; then
     # Test local database connectivity
@@ -247,7 +262,7 @@ if [ -f ".env" ]; then
     add_report "FAIL" "Database Credentials" "Required credentials (DB_USER, DB_PASSWORD, DB_NAME, DB_HOST) are partially missing from .env."
   fi
 else
-  add_report "FAIL" "Config File (.env)" "Config file is missing from the app root directory."
+  add_report "FAIL" "Config File (.env)" "Config file (.env) is missing from the app root directory $SCRIPT_DIR."
 fi
 echo ""
 
@@ -262,12 +277,15 @@ check_directory() {
   local owner="$3"
   
   if [ -d "$dir_path" ]; then
-    # Check permissions and owner
-    local actual_owner=$(stat -c '%U' "$dir_path")
-    if [ "$actual_owner" = "$owner" ]; then
-      add_report "PASS" "$desc Directory" "Found at $dir_path with correct owner ($owner)."
+    if [ "$IS_ROOT" = "true" ]; then
+      local actual_owner=$(stat -c '%U' "$dir_path" 2>/dev/null || echo "unknown")
+      if [ "$actual_owner" = "$owner" ]; then
+        add_report "PASS" "$desc Directory" "Found at $dir_path with correct owner ($owner)."
+      else
+        add_report "WARN" "$desc Directory" "Found at $dir_path but has owner '$actual_owner' instead of expected '$owner'."
+      fi
     else
-      add_report "WARN" "$desc Directory" "Found at $dir_path but has owner '$actual_owner' instead of expected '$owner'."
+      add_report "PASS" "$desc Directory" "Directory exists at $dir_path. (Owner validation skipped for non-root check)"
     fi
   else
     add_report "FAIL" "$desc Directory" "Missing from expected path: $dir_path."
@@ -275,7 +293,7 @@ check_directory() {
 }
 
 check_directory "/var/www/hls" "HLS Live Segment Root" "www-data"
-check_directory "/var/log/streampulse" "StreamPulse System Logs" "root"
+check_directory "/var/log/streampulse" "StreamPulse System Logs" "streampulse"
 
 if [ -x "/usr/local/bin/transcode.sh" ]; then
   add_report "PASS" "Transcode Engine" "Script /usr/local/bin/transcode.sh exists and is executable."

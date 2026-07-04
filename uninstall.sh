@@ -8,6 +8,9 @@
 # Exit immediately if a command fails in an unexpected way
 set -uo pipefail
 
+# Get the absolute path of the directory containing this script
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+
 # Terminal colors for professional formatting
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -37,20 +40,42 @@ fi
 
 print_header
 
-# Interactive prompt for confirmation
-echo -e "${YELLOW}${BOLD}WARNING: This utility will completely decommission and remove StreamPulse services!${NC}"
-echo -e "This will stop streaming, delete live video playlists, and optionally drop databases."
-read -p "Are you absolutely sure you want to proceed? (y/N): " confirm_uninstall
-if [[ ! "$confirm_uninstall" =~ ^[Yy]$ ]]; then
-  echo -e "\n${GREEN}[✔] Uninstallation canceled. StreamPulse remains active.${NC}\n"
-  exit 0
+# Parse command line options for non-interactive execution
+NON_INTERACTIVE=false
+PURGE_DB=false
+
+# Support environment variable override or command-line arguments
+if [ "${NON_INTERACTIVE:-false}" = "true" ]; then
+  NON_INTERACTIVE=true
+  PURGE_DB=true
 fi
 
-# Ask about database deletion
-PURGE_DB=false
-read -p "Do you also want to delete the PostgreSQL database and admin user role? (y/N): " confirm_db
-if [[ "$confirm_db" =~ ^[Yy]$ ]]; then
-  PURGE_DB=true
+for arg in "$@"; do
+  case $arg in
+    --yes|--non-interactive|-y)
+      NON_INTERACTIVE=true
+      PURGE_DB=true
+      ;;
+  esac
+done
+
+if [ "$NON_INTERACTIVE" = "true" ]; then
+  echo -e "${GREEN}[✔] Non-interactive mode activated. Proceeding with full StreamPulse decommission...${NC}\n"
+else
+  # Interactive prompt for confirmation
+  echo -e "${YELLOW}${BOLD}WARNING: This utility will completely decommission and remove StreamPulse services!${NC}"
+  echo -e "This will stop streaming, delete live video playlists, and optionally drop databases."
+  read -p "Are you absolutely sure you want to proceed? (y/N): " confirm_uninstall
+  if [[ ! "$confirm_uninstall" =~ ^[Yy]$ ]]; then
+    echo -e "\n${GREEN}[✔] Uninstallation canceled. StreamPulse remains active.${NC}\n"
+    exit 0
+  fi
+
+  # Ask about database deletion
+  read -p "Do you also want to delete the PostgreSQL database and admin user role? (y/N): " confirm_db
+  if [[ "$confirm_db" =~ ^[Yy]$ ]]; then
+    PURGE_DB=true
+  fi
 fi
 
 echo -e "\n${BLUE}[*] Decommissioning StreamPulse background services...${NC}"
@@ -126,12 +151,12 @@ fi
 if [ "$PURGE_DB" = true ]; then
   echo -e "\n${BLUE}[*] Purging database schemas and admin roles from PostgreSQL...${NC}"
   
-  # Read credentials from local .env if available
+  # Read credentials from local .env if available, stripping quotes
   DB_USER=""
   DB_NAME=""
-  if [ -f ".env" ]; then
-    DB_USER=$(grep "^DB_USER=" .env | cut -d'=' -f2- | xargs)
-    DB_NAME=$(grep "^DB_NAME=" .env | cut -d'=' -f2- | xargs)
+  if [ -f "$SCRIPT_DIR/.env" ]; then
+    DB_USER=$(grep "^DB_USER=" "$SCRIPT_DIR/.env" | cut -d'=' -f2- | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+    DB_NAME=$(grep "^DB_NAME=" "$SCRIPT_DIR/.env" | cut -d'=' -f2- | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
   fi
   
   DB_USER=${DB_USER:-"streampulse_admin"}
@@ -163,9 +188,17 @@ if [ -f "/etc/cron.daily/streampulse-backup" ]; then
 fi
 
 # Rebuild frontend dist files cleanup
-if [ -d "dist" ]; then
+if [ -d "$SCRIPT_DIR/dist" ]; then
   echo -e "  - Cleaning compiled frontend build assets (dist)..."
-  rm -rf dist
+  rm -rf "$SCRIPT_DIR/dist"
+fi
+
+# 6. Remove dedicated Linux user streampulse if it exists
+echo -e "\n${BLUE}[*] Checking for dedicated streampulse Linux user...${NC}"
+if id "streampulse" &>/dev/null; then
+  echo -e "  - Removing streampulse Linux user..."
+  userdel -r streampulse || userdel streampulse || true
+  echo -e "  [${GREEN}✔${NC}] Linux user 'streampulse' successfully removed."
 fi
 
 echo -e "\n${GREEN}${BOLD}==============================================================================${NC}"
