@@ -172,6 +172,22 @@ echo ""
 # ----------------------------------------------------
 print_section "3. Background Daemon Services Status"
 
+is_port_listening() {
+  local port="$1"
+  if command -v ss &>/dev/null; then
+    ss -tuln | grep -q -E ":$port\s" && return 0
+  elif command -v netstat &>/dev/null; then
+    netstat -tuln | grep -q -E ":$port\s" && return 0
+  else
+    # Parse /proc/net/tcp for absolute fallback
+    local hex_port=$(printf '%04X' "$port" 2>/dev/null || echo "")
+    if [ -n "$hex_port" ] && [ -f "/proc/net/tcp" ]; then
+      grep -q -i ":$hex_port" /proc/net/tcp 2>/dev/null && return 0
+    fi
+  fi
+  return 1
+}
+
 check_service() {
   local service_name="$1"
   local display_name="$2"
@@ -180,58 +196,123 @@ check_service() {
   local installed=false
   local enabled=false
   local active=false
+  local resolved_name=""
   
-  # 1. Use systemctl list-unit-files to verify installation
-  if systemctl list-unit-files --all 2>/dev/null | awk '{print $1}' | grep -E -i -q "^${service_name}(@.*)?(\.service)?$"; then
-    installed=true
-  # 2. Fallback check: systemctl status exit code (LSB status standard: 0, 1, 2, 3 mean known/installed, 4 means not found)
-  elif systemctl status "${service_name}" 2>/dev/null; [ $? -lt 4 ]; then
-    installed=true
-  # 3. Fallback check: systemctl show LoadState check
-  elif systemctl show -p LoadState "${service_name}" 2>/dev/null | grep -q "LoadState=loaded"; then
-    installed=true
-  # 4. Fallback check: Check physical systemd service file locations
-  elif [ -f "/etc/systemd/system/${service_name}.service" ] || \
-       [ -f "/lib/systemd/system/${service_name}.service" ] || \
-       [ -f "/usr/lib/systemd/system/${service_name}.service" ] || \
-       [ -f "/etc/systemd/system/${service_name}@.service" ] || \
-       [ -f "/lib/systemd/system/${service_name}@.service" ] || \
-       [ -f "/usr/lib/systemd/system/${service_name}@.service" ]; then
-    installed=true
-  # 5. Fallback check: Check legacy SysV init script location
-  elif [ -x "/etc/init.d/${service_name}" ]; then
-    installed=true
+  # 1. Query systemctl list-unit-files to verify installation & find matching service names
+  local list_unit_files_output=""
+  if command -v systemctl &>/dev/null; then
+    list_unit_files_output=$(systemctl list-unit-files --all --type=service 2>/dev/null)
   fi
   
-  # Use systemctl is-enabled and systemctl is-active with robust process/port fallbacks to completely eliminate false negatives
+  if [ -n "$list_unit_files_output" ]; then
+    # Look for exact service or template service name match
+    resolved_name=$(echo "$list_unit_files_output" | awk '{print $1}' | grep -E -i "^${service_name}(@.*)?(\.service)?$" | head -n 1)
+    
+    # If not found, look for substring match ending with .service
+    if [ -z "$resolved_name" ]; then
+      resolved_name=$(echo "$list_unit_files_output" | awk '{print $1}' | grep -E -i "${service_name}" | grep -E "\.service$" | head -n 1)
+    fi
+  fi
+  
+  # 2. Query systemctl list-units if list-unit-files didn't yield anything
+  if [ -z "$resolved_name" ] && command -v systemctl &>/dev/null; then
+    resolved_name=$(systemctl list-units --all --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -E -i "^${service_name}(@.*)?\.service$" | head -n 1)
+    if [ -z "$resolved_name" ]; then
+      resolved_name=$(systemctl list-units --all --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -E -i "${service_name}" | grep -E "\.service$" | head -n 1)
+    fi
+  fi
+  
+  # 3. Fallback physical service files check
+  if [ -z "$resolved_name" ]; then
+    local search_dirs=("/etc/systemd/system" "/lib/systemd/system" "/usr/lib/systemd/system")
+    for sdir in "${search_dirs[@]}"; do
+      if [ -d "$sdir" ]; then
+        local found_file=$(find "$sdir" -maxdepth 2 -name "${service_name}.service" -o -name "${service_name}@*.service" -o -name "${service_name}@.service" 2>/dev/null | head -n 1)
+        if [ -n "$found_file" ]; then
+          resolved_name=$(basename "$found_file")
+          break
+        fi
+      fi
+    done
+  fi
+  
+  # 4. Fallback SysV init
+  if [ -z "$resolved_name" ] && [ -x "/etc/init.d/${service_name}" ]; then
+    resolved_name="${service_name}"
+  fi
+  
+  # Set installed based on resolved_name discovery
+  if [ -n "$resolved_name" ]; then
+    installed=true
+  else
+    # Fallback to checking systemctl status code directly
+    if command -v systemctl &>/dev/null; then
+      systemctl status "${service_name}" &>/dev/null
+      if [ $? -lt 4 ]; then
+        installed=true
+        resolved_name="${service_name}"
+      fi
+    fi
+  fi
+  
+  # 5. Dynamic resolution of templated instances (e.g. postgresql@.service -> postgresql@16-main.service)
+  if [ "$installed" = true ] && [[ "$resolved_name" == *"@.service" ]] && command -v systemctl &>/dev/null; then
+    local prefix="${resolved_name%@.service}"
+    local active_instance=$(systemctl list-units --all --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -E -i "^${prefix}@[0-9a-zA-Z_-]+\.service$" | head -n 1)
+    if [ -n "$active_instance" ]; then
+      resolved_name="$active_instance"
+    fi
+  fi
+  
+  # 6. Process and Port-level verification to completely eliminate false negatives
+  local process_running=false
+  local port_listening=false
+  
+  if [ "$service_name" = "nginx" ] && { pgrep -x nginx &>/dev/null || pidof nginx &>/dev/null; }; then
+    process_running=true
+  elif [ "$service_name" = "postgresql" ] && { pgrep -x postgres &>/dev/null || pgrep -x postmaster &>/dev/null || pidof postgres &>/dev/null; }; then
+    process_running=true
+  elif [ "$service_name" = "streampulse" ] && { pgrep -f "server.ts" &>/dev/null || pgrep -f "server.js" &>/dev/null || pgrep -f "streampulse" &>/dev/null; }; then
+    process_running=true
+  elif [ "$service_name" = "fail2ban" ] && { pgrep -f fail2ban &>/dev/null || [ -f "/var/run/fail2ban/fail2ban.sock" ]; }; then
+    process_running=true
+  elif [ "$service_name" = "docker" ] && { pgrep -x dockerd &>/dev/null || [ -S "/var/run/docker.sock" ]; }; then
+    process_running=true
+  fi
+  
+  if [ "$service_name" = "nginx" ] && { is_port_listening "80" || is_port_listening "443"; }; then
+    port_listening=true
+  elif [ "$service_name" = "postgresql" ] && is_port_listening "5432"; then
+    port_listening=true
+  elif [ "$service_name" = "streampulse" ] && is_port_listening "3000"; then
+    port_listening=true
+  fi
+  
+  if [ "$process_running" = true ] || [ "$port_listening" = true ]; then
+    installed=true
+    active=true
+  fi
+  
+  # 7. Use systemctl is-enabled / multi-user.target.wants directory to check boot status
   if [ "$installed" = true ]; then
-    # Verify enablement with systemctl is-enabled
-    if systemctl is-enabled --quiet "$service_name" 2>/dev/null; then
-      enabled=true
-    elif [ -f "/etc/systemd/system/multi-user.target.wants/${service_name}.service" ] || \
-         [ -f "/etc/systemd/system/multi-user.target.wants/${service_name}@.service" ]; then
-      enabled=true
+    if [ -n "$resolved_name" ]; then
+      if systemctl is-enabled --quiet "$resolved_name" 2>/dev/null; then
+        enabled=true
+      elif [ -f "/etc/systemd/system/multi-user.target.wants/${resolved_name}" ] || \
+           [ -f "/etc/systemd/system/multi-user.target.wants/${service_name}.service" ]; then
+        enabled=true
+      fi
     fi
     
-    # Verify runtime state with systemctl is-active and safe process checks
-    if systemctl is-active --quiet "$service_name" 2>/dev/null; then
-      active=true
-    else
-      # Process-level active status fallbacks to eliminate false negatives
-      if [ "$service_name" = "nginx" ] && { pgrep -x nginx &>/dev/null || pidof nginx &>/dev/null; }; then
-        active=true
-      elif [ "$service_name" = "postgresql" ] && { pgrep -x postgres &>/dev/null || pgrep -x postmaster &>/dev/null || pidof postgres &>/dev/null; }; then
-        active=true
-      elif [ "$service_name" = "streampulse" ] && { pgrep -f "server.ts" &>/dev/null || pgrep -f "server.js" &>/dev/null || pgrep -f "streampulse" &>/dev/null; }; then
-        active=true
-      elif [ "$service_name" = "fail2ban" ] && { pgrep -f fail2ban &>/dev/null || [ -f "/var/run/fail2ban/fail2ban.sock" ]; }; then
-        active=true
-      elif [ "$service_name" = "docker" ] && { pgrep -x dockerd &>/dev/null || [ -S "/var/run/docker.sock" ]; }; then
+    # Verify active state via systemctl if not already confirmed active by process/port
+    if [ "$active" = false ] && [ -n "$resolved_name" ]; then
+      if systemctl is-active --quiet "$resolved_name" 2>/dev/null; then
         active=true
       fi
     fi
   fi
   
+  # 8. Report the status
   if [ "$installed" = false ]; then
     if [ "$required" = "true" ]; then
       add_report "FAIL" "$display_name Service" "Service unit '${service_name}.service' is NOT installed on this system."

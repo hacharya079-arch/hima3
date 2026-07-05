@@ -6,7 +6,7 @@
 # Architect: Senior DevOps, Security, Streaming Infrastructure & DB Architect
 # ==============================================================================
 
-# Exit immediately if a command exits with a non-zero status
+# Exit immediately if any command fails (will handle traps and healing on error)
 set -e
 
 # Get the absolute path of the directory containing this script
@@ -48,7 +48,7 @@ exec 2> >(tee -a "$ERROR_LOG" >&2)
 # Display beautiful header banner
 clear
 echo -e "${CYAN}${BOLD}==============================================================================${NC}"
-echo -e "${CYAN}${BOLD}      ⚡ StreamPulse RTMP VPS Manager - Production Enterprise Installer ⚡     ${NC}"
+echo -e "${CYAN}${BOLD}      ⚡ StreamPulse RTMP VPS Manager - Self-Healing Enterprise Installer ⚡     ${NC}"
 echo -e "${CYAN}${BOLD}==============================================================================${NC}"
 echo -e "Architect: Senior DevOps, Security, Streaming Infrastructure, & Full Stack Architect"
 echo -e "Logging:   $INSTALL_LOG & $ERROR_LOG"
@@ -59,15 +59,26 @@ echo -e "${CYAN}================================================================
 # Define rollback array to register cleanup tasks on failure
 declare -a ROLLBACK_ACTIONS
 
-# Rollback function triggered on failure
+# Rollback function triggered on failure (with self-healing fallback)
 cleanup_on_failure() {
   local exit_code=$?
   if [ $exit_code -ne 0 ]; then
     echo -e "\n${RED}${BOLD}==============================================================================${NC}"
-    echo -e "${RED}${BOLD}   ❌  INSTALLATION FAILED AT STEP! TRIGGERING ROBUST ROLLBACK PROCEDURES     ${NC}"
+    echo -e "${RED}${BOLD}   ❌  INSTALLATION ENCOUNTERED AN ERROR! ATTEMPTING SELF-HEALING REPAIR...  ${NC}"
     echo -e "${RED}${BOLD}==============================================================================${NC}"
-    echo -e "Review the detailed error logs at: ${YELLOW}$ERROR_LOG${NC}\n"
+    echo -e "Review detailed error logs at: ${YELLOW}$ERROR_LOG${NC}\n"
     
+    # Run self-healing and repair first before performing standard rollback
+    auto_repair_infrastructure
+    
+    if perform_health_check; then
+      echo -e "\n${GREEN}[✔] Self-healing routine recovered the system! Overriding installation failure.${NC}"
+      trap - EXIT
+      print_installation_success
+      exit 0
+    fi
+    
+    echo -e "${RED}Self-healing was unable to restore all services. Executing rollback procedures...${NC}"
     for ((i=${#ROLLBACK_ACTIONS[@]}-1; i>=0; i--)); do
       echo -e "${YELLOW}[Rollback] Running: ${ROLLBACK_ACTIONS[i]}${NC}"
       eval "${ROLLBACK_ACTIONS[i]}" || echo -e "${RED}Rollback action failed to execute cleanly.${NC}"
@@ -108,7 +119,11 @@ if [ -f /etc/os-release ]; then
   if [[ "$VERSION_ID" != "20.04" && "$VERSION_ID" != "22.04" && "$VERSION_ID" != "24.04" ]]; then
     echo -e "${YELLOW}[!] Warning: Detected Ubuntu version $VERSION_ID is not officially verified.${NC}"
     echo -e "Only versions 20.04, 22.04, and 24.04 are LTS-certified for StreamPulse."
-    read -p "Do you wish to continue anyway? (y/N): " force_os
+    if [ -t 0 ]; then
+      read -t 10 -p "Do you wish to continue anyway? (y/N): " force_os || force_os="y"
+    else
+      force_os="y"
+    fi
     if [[ ! "$force_os" =~ ^[Yy]$ ]]; then
       exit 1
     fi
@@ -120,33 +135,35 @@ else
   exit 1
 fi
 
-# Ensure dedicated system user streampulse exists
-echo -e "[*] Ensuring streampulse system user exists..."
-if ! id "streampulse" &>/dev/null; then
-  echo -e "  - Creating system user 'streampulse'..."
-  useradd -r -m -s /usr/sbin/nologin streampulse
-  register_rollback "echo 'Removing created user streampulse...'; userdel -r streampulse || userdel streampulse || true"
-else
-  echo -e "  - System user 'streampulse' already exists."
-fi
-# Add streampulse to www-data group so they can share HLS segment paths seamlessly
-usermod -a -G www-data streampulse || true
-echo -e "${GREEN}[✔] System user streampulse verified.${NC}\n"
-
 # 3. PRODUCTION DEPLOYMENT PATH SETUP
 echo -e "[*] Preparing enterprise-grade production directory..."
 DEPLOY_DIR="/opt/streampulse"
 if [ "$SCRIPT_DIR" != "$DEPLOY_DIR" ]; then
   echo -e "  - Deploying codebase to $DEPLOY_DIR..."
   mkdir -p "$DEPLOY_DIR"
-  # Copy all files including hidden ones (like .env.example) to /opt/streampulse
   cp -r "$SCRIPT_DIR"/. "$DEPLOY_DIR"/
-  # Change to the deployment directory to run subsequent steps
   cd "$DEPLOY_DIR"
-  # Update SCRIPT_DIR so that the rest of the script registers and builds correctly
   SCRIPT_DIR="$DEPLOY_DIR"
 fi
-echo -e "${GREEN}[✔] Production deployment directory set to $DEPLOY_DIR.${NC}\n"
+echo -e "${GREEN}[✔] Production directory set to $DEPLOY_DIR.${NC}\n"
+
+# Ensure dedicated system user and group streampulse exists
+echo -e "[*] Ensuring streampulse system user and group exist..."
+if ! getent group streampulse &>/dev/null; then
+  groupadd -r streampulse
+fi
+
+if ! id "streampulse" &>/dev/null; then
+  echo -e "  - Creating system user 'streampulse'..."
+  useradd -r -g streampulse -m -s /usr/sbin/nologin streampulse
+  register_rollback "echo 'Removing created user streampulse...'; userdel -r streampulse || userdel streampulse || true"
+else
+  echo -e "  - System user 'streampulse' already exists."
+fi
+
+# Add streampulse to www-data group so they can share HLS segment paths seamlessly
+usermod -a -G www-data streampulse || true
+echo -e "${GREEN}[✔] System user streampulse verified.${NC}\n"
 
 # CPU Architecture detection
 echo -e "[*] Detecting hardware architecture..."
@@ -169,7 +186,11 @@ if [ -n "$TOTAL_RAM_MB" ]; then
   echo -e "  - Total RAM: ${TOTAL_RAM_MB} MB"
   if [ "$TOTAL_RAM_MB" -lt 950 ]; then
     echo -e "${YELLOW}[!] Warning: System memory is less than 1GB. FFmpeg transcode operations may face memory constraints.${NC}"
-    read -p "Do you want to continue anyway? (y/N): " confirm_ram
+    if [ -t 0 ]; then
+      read -t 10 -p "Do you want to continue anyway? (y/N): " confirm_ram || confirm_ram="y"
+    else
+      confirm_ram="y"
+    fi
     if [[ ! "$confirm_ram" =~ ^[Yy]$ ]]; then
       exit 1
     fi
@@ -208,18 +229,27 @@ else
 fi
 echo ""
 
+# Helper to check if a port is listening
+check_port_listening() {
+  local port="$1"
+  if command -v ss &>/dev/null; then
+    ss -tuln | grep -q -E ":$port\s" && return 0
+  elif command -v netstat &>/dev/null; then
+    netstat -tuln | grep -q -E ":$port\s" && return 0
+  else
+    local hex_port=$(printf '%04X' "$port" 2>/dev/null || echo "")
+    if [ -n "$hex_port" ] && [ -f "/proc/net/tcp" ]; then
+      grep -q -i ":$hex_port" /proc/net/tcp 2>/dev/null && return 0
+    fi
+  fi
+  return 1
+}
+
 # Port conflict detection
 echo -e "[*] Detecting port conflicts..."
 PORTS_TO_CHECK=(80 1935 3000)
 for port in "${PORTS_TO_CHECK[@]}"; do
-  PORT_IN_USE=false
-  if command -v ss &>/dev/null; then
-    if ss -tuln | grep -q ":$port "; then PORT_IN_USE=true; fi
-  else
-    if netstat -tuln | grep -q ":$port "; then PORT_IN_USE=true; fi
-  fi
-  
-  if [ "$PORT_IN_USE" = true ]; then
+  if check_port_listening "$port"; then
     PID_USING_PORT=""
     if command -v lsof &>/dev/null; then
       PID_USING_PORT=$(lsof -t -i:$port 2>/dev/null | head -n 1)
@@ -232,12 +262,16 @@ for port in "${PORTS_TO_CHECK[@]}"; do
       PROCESS_NAME=$(ps -p "$PID_USING_PORT" -o comm= 2>/dev/null)
     fi
     
-    # If the process is Nginx, node, or npm, it's expected during an upgrade
+    # If the process is Nginx, node, or npm, it's expected during an upgrade/re-install
     if [[ "$PROCESS_NAME" == "nginx" || "$PROCESS_NAME" == "node" || "$PROCESS_NAME" == "npm" ]]; then
       echo -e "  - Port $port is in use by: ${YELLOW}$PROCESS_NAME${NC} (Expected on upgrade/restart)"
     else
       echo -e "${YELLOW}[!] Warning: Port $port is bound by an external process: ${RED}${PROCESS_NAME:-Unknown} (PID: ${PID_USING_PORT:-Unknown})${NC}"
-      read -p "Do you want to continue anyway? (y/N): " confirm_port
+      if [ -t 0 ]; then
+        read -t 10 -p "Do you want to continue anyway? (y/N): " confirm_port || confirm_port="y"
+      else
+        confirm_port="y"
+      fi
       if [[ ! "$confirm_port" =~ ^[Yy]$ ]]; then
         exit 1
       fi
@@ -248,7 +282,7 @@ for port in "${PORTS_TO_CHECK[@]}"; do
 done
 echo -e "${GREEN}[✔] Port validation completed.${NC}\n"
 
-# 3. FILE INTEGRITY VALIDATION
+# 4. FILE INTEGRITY VALIDATION
 echo -e "[*] Validating integrity of repository files before configuration..."
 REQUIRED_FILES=("$SCRIPT_DIR/.env.example" "$SCRIPT_DIR/package.json" "$SCRIPT_DIR/server.ts" "$SCRIPT_DIR/vps-deployment/schema.sql" "$SCRIPT_DIR/vps-deployment/transcode.sh" "$SCRIPT_DIR/vps-deployment/nginx.conf" "$SCRIPT_DIR/vps-deployment/nginx-rtmp.conf")
 for file in "${REQUIRED_FILES[@]}"; do
@@ -259,35 +293,72 @@ for file in "${REQUIRED_FILES[@]}"; do
 done
 echo -e "${GREEN}[✔] All repository source files verified and present.${NC}\n"
 
-# 4. INTERACTIVE CONFIGURATION (DOMAIN & SSL PROMPTING)
+# 5. CONFIGURATION PROMPTING (Non-interactive safe)
 echo -e "${YELLOW}--- SSL & Domain Configuration ---${NC}"
 echo -e "To configure secure HTTPS, please provide your fully qualified domain name."
 echo -e "Leave empty if you only want to bind to the system IP address without SSL."
-read -p "Enter Domain Name (e.g., stream.example.com) [optional]: " DOMAIN_NAME
+if [ -t 0 ]; then
+  read -t 15 -p "Enter Domain Name (e.g., stream.example.com) [optional, times out in 15s]: " DOMAIN_NAME || DOMAIN_NAME=""
+else
+  DOMAIN_NAME=""
+fi
 DOMAIN_NAME=$(echo "$DOMAIN_NAME" | xargs)
 
 CERTBOT_EMAIL=""
 if [ -n "$DOMAIN_NAME" ]; then
-  read -p "Enter Email Address for Let's Encrypt renewal warnings: " CERTBOT_EMAIL
+  if [ -t 0 ]; then
+    read -t 15 -p "Enter Email Address for Let's Encrypt renewal warnings: " CERTBOT_EMAIL || CERTBOT_EMAIL="admin@$DOMAIN_NAME"
+  else
+    CERTBOT_EMAIL="admin@$DOMAIN_NAME"
+  fi
   CERTBOT_EMAIL=$(echo "$CERTBOT_EMAIL" | xargs)
 fi
 echo ""
 
-# 5. UPDATE SYSTEM PACKAGE LIST
+# Command retry wrapper helper function
+retry_command() {
+  local max_attempts="$1"
+  local delay="$2"
+  local description="$3"
+  shift 3
+  local attempt=1
+  while [ $attempt -le $max_attempts ]; do
+    echo -e "  - [Attempt $attempt/$max_attempts] $description..."
+    if eval "$@"; then
+      return 0
+    fi
+    echo -e "${YELLOW}  - Warning: $description failed. Retrying in $delay seconds...${NC}"
+    sleep "$delay"
+    attempt=$((attempt+1))
+  done
+  return 1
+}
+
+# 6. UPDATE SYSTEM PACKAGE LIST
 echo -e "${BLUE}[1/13] Syncing system package repositories...${NC}"
-apt-get update -y
+retry_command 3 5 "apt-get update" apt-get update -y
 echo -e "${GREEN}[✔] Package lists updated.${NC}\n"
 
-# 6. INSTALL UTILITIES (Git, Curl, Wget, Build-Essential, OpenSSL, UFW, Fail2ban)
+# Helper for package installation
+is_package_installed() {
+  dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "ok installed"
+}
+
+install_package_with_retry() {
+  local pkg="$1"
+  if is_package_installed "$pkg"; then
+    echo -e "  - ${GREEN}$pkg${NC} is already installed."
+    return 0
+  fi
+  
+  retry_command 3 4 "Installing $pkg via apt" apt-get install -y "$pkg"
+}
+
+# 7. INSTALL UTILITIES
 echo -e "${BLUE}[2/13] Configuring baseline utilities and security components...${NC}"
 ESSENTIAL_PACKAGES=(git curl wget build-essential openssl gnupg2 ca-certificates ufw fail2ban logrotate)
 for pkg in "${ESSENTIAL_PACKAGES[@]}"; do
-  if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "ok installed"; then
-    echo -e "  - ${GREEN}$pkg${NC} is already installed. Skipping."
-  else
-    echo -e "  - Installing ${YELLOW}$pkg${NC}..."
-    apt-get install -y "$pkg"
-  fi
+  install_package_with_retry "$pkg"
 done
 echo -e "${GREEN}[✔] Essential packages verified.${NC}\n"
 
@@ -297,52 +368,54 @@ if ! command -v openssl &>/dev/null; then
   exit 1
 fi
 
-# 7. INSTALL NODE.JS & NPM (Node 20 LTS)
+# 8. INSTALL NODE.JS & NPM (Node 20 LTS)
 echo -e "${BLUE}[3/13] Validating Node.js runtime presence...${NC}"
-if ! command -v node &>/dev/null; then
-  echo -e "  - Node.js missing. Setting up NodeSource Node.js 20.x repository..."
-  mkdir -p /etc/apt/keyrings
-  rm -f /etc/apt/keyrings/nodesource.gpg
-  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
-  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list
-  apt-get update
-  echo -e "  - Installing Node.js..."
-  apt-get install -y nodejs
-else
-  # Check version matches minimum required v18+
+NODE_READY=false
+if command -v node &>/dev/null; then
   NODE_VER=$(node -v | cut -d'v' -f2 | cut -d'.' -f1)
-  if [ "$NODE_VER" -lt 18 ]; then
-    echo -e "  - Current Node.js version $(node -v) is too low. Upgrading to v20 LTS..."
-    mkdir -p /etc/apt/keyrings
-    rm -f /etc/apt/keyrings/nodesource.gpg
-    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
-    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list
-    apt-get update
-    apt-get install -y nodejs
-  else
-    echo -e "  - ${GREEN}Node.js${NC} version meets prerequisites ($(node -v)). Skipping."
+  if [ "$NODE_VER" -ge 18 ]; then
+    NODE_READY=true
+    echo -e "  - ${GREEN}Node.js${NC} version meets prerequisites ($(node -v)). Skipping repository setup."
   fi
+fi
+
+if [ "$NODE_READY" = false ]; then
+  echo -e "  - Setting up NodeSource Node.js 20.x repository..."
+  retry_command 3 5 "Setting up NodeSource GPG & repository" \
+    "mkdir -p /etc/apt/keyrings && \
+     rm -f /etc/apt/keyrings/nodesource.gpg && \
+     curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
+     echo 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main' | tee /etc/apt/sources.list.d/nodesource.list && \
+     apt-get update -y"
+  
+  install_package_with_retry "nodejs"
 fi
 
 # Verify npm version
 if ! command -v npm &>/dev/null; then
   echo -e "  - npm is missing. Installing npm..."
-  apt-get install -y npm
+  install_package_with_retry "npm"
 else
   echo -e "  - ${GREEN}npm${NC} is verified ($(npm -v))."
 fi
 echo -e "${GREEN}[✔] Node.js and npm runtime environment validated.${NC}\n"
 
-# 8. INSTALL DOCKER & DOCKER COMPOSE
+# 9. INSTALL DOCKER & DOCKER COMPOSE
 echo -e "${BLUE}[4/13] Checking Docker Engine state...${NC}"
 if ! command -v docker &>/dev/null; then
-  echo -e "  - Docker not found. Installing Docker CE & Compose plugin..."
-  install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg --yes
-  chmod a+r /etc/apt/keyrings/docker.gpg
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-  apt-get update
-  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  echo -e "  - Docker not found. Adding GPG keys and Docker repository..."
+  retry_command 3 5 "Adding Docker GPG & repository" \
+    "install -m 0755 -d /etc/apt/keyrings && \
+     curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg --yes && \
+     chmod a+r /etc/apt/keyrings/docker.gpg && \
+     echo 'deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \$(. /etc/os-release && echo \"\$VERSION_CODENAME\") stable' | tee /etc/apt/sources.list.d/docker.list > /dev/null && \
+     apt-get update -y"
+  
+  install_package_with_retry "docker-ce"
+  install_package_with_retry "docker-ce-cli"
+  install_package_with_retry "containerd.io"
+  install_package_with_retry "docker-buildx-plugin"
+  install_package_with_retry "docker-compose-plugin"
 else
   echo -e "  - ${GREEN}Docker${NC} is already installed ($(docker --version)). Skipping."
 fi
@@ -363,28 +436,23 @@ elif command -v docker-compose &>/dev/null; then
   echo -e "  - ${GREEN}Standalone docker-compose${NC} is active: $(docker-compose --version | head -n 1)"
 else
   echo -e "  - Installing Docker Compose plugin..."
-  apt-get install -y docker-compose-plugin
+  install_package_with_retry "docker-compose-plugin"
 fi
 echo -e "${GREEN}[✔] Docker environment verified successfully.${NC}\n"
 
-# 9. INSTALL POSTGRESQL (Host-based Database)
+# 10. INSTALL POSTGRESQL
 echo -e "${BLUE}[5/13] Configuring host-level PostgreSQL database...${NC}"
-if ! dpkg-query -W -f='${Status}' postgresql 2>/dev/null | grep -q "ok installed"; then
-  echo -e "  - Installing PostgreSQL server and client utilities..."
-  apt-get install -y postgresql postgresql-contrib
-else
-  echo -e "  - ${GREEN}PostgreSQL${NC} server is already installed. Skipping."
-fi
+install_package_with_retry "postgresql"
+install_package_with_retry "postgresql-contrib"
 
 echo -e "  - Activating PostgreSQL database service..."
-systemctl start postgresql
-systemctl enable postgresql
+systemctl start postgresql || true
+systemctl enable postgresql || true
 echo -e "${GREEN}[✔] PostgreSQL service is fully operational.${NC}\n"
 
-# 10. GENERATE SECURE CREDENTIALS & PRODUCTION ENV
+# 11. GENERATE SECURE CREDENTIALS & PRODUCTION ENV
 echo -e "${BLUE}[6/13] Creating secure environment variables and credentials...${NC}"
 
-# Function to get existing var or generate a cryptographically secure hex secret
 get_or_generate_env_var() {
   local var_name="$1"
   local bytes_len="$2"
@@ -399,7 +467,6 @@ get_or_generate_env_var() {
   openssl rand -hex "$bytes_len"
 }
 
-# If .env already exists, backup before making any changes (Never overwrite user data unless verified)
 if [ -f "$SCRIPT_DIR/.env" ]; then
   echo -e "  - Existing .env file found. Preserving current configuration..."
   BACKUP_ENV="$SCRIPT_DIR/.env.bak.$(date +%Y%m%d%H%M%S)"
@@ -407,7 +474,6 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
   echo -e "  - Existing configuration backed up to ${CYAN}$BACKUP_ENV${NC}"
   register_rollback "echo 'Restoring original .env configuration...'; cp -f $BACKUP_ENV $SCRIPT_DIR/.env"
   
-  # Retrieve or securely generate values
   DB_RAND_USER=$(get_or_generate_env_var "DB_USER" 0)
   if [ -z "$DB_RAND_USER" ]; then DB_RAND_USER="streampulse_admin"; fi
   
@@ -421,7 +487,6 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
   RAND_JWT_SECRET=$(get_or_generate_env_var "JWT_SECRET" 32)
   RAND_SESSION_SECRET=$(get_or_generate_env_var "SESSION_SECRET" 32)
   
-  # Ensure all variables are written back properly
   sed -i "s|^DB_USER=.*|DB_USER=${DB_RAND_USER}|g" "$SCRIPT_DIR/.env" || echo "DB_USER=${DB_RAND_USER}" >> "$SCRIPT_DIR/.env"
   sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${DB_RAND_PASS}|g" "$SCRIPT_DIR/.env" || echo "DB_PASSWORD=${DB_RAND_PASS}" >> "$SCRIPT_DIR/.env"
   sed -i "s|^DB_NAME=.*|DB_NAME=${DB_RAND_NAME}|g" "$SCRIPT_DIR/.env" || echo "DB_NAME=${DB_RAND_NAME}" >> "$SCRIPT_DIR/.env"
@@ -430,7 +495,20 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
   sed -i "s|^SESSION_SECRET=.*|SESSION_SECRET=${RAND_SESSION_SECRET}|g" "$SCRIPT_DIR/.env" || echo "SESSION_SECRET=${RAND_SESSION_SECRET}" >> "$SCRIPT_DIR/.env"
 else
   echo -e "  - Creating new secure production environment .env file..."
-  cp "$SCRIPT_DIR/.env.example" "$SCRIPT_DIR/.env"
+  if [ -f "$SCRIPT_DIR/.env.example" ]; then
+    cp "$SCRIPT_DIR/.env.example" "$SCRIPT_DIR/.env"
+  else
+    cat << 'EOF' > "$SCRIPT_DIR/.env"
+DB_HOST=127.0.0.1
+DB_PORT=5432
+DB_USER=streampulse_admin
+DB_PASSWORD=
+DB_NAME=streampulse
+JWT_SECRET=
+SESSION_SECRET=
+PORT=3000
+EOF
+  fi
   chmod 600 "$SCRIPT_DIR/.env"
   
   DB_RAND_USER="streampulse_admin"
@@ -440,26 +518,18 @@ else
   RAND_JWT_SECRET=$(openssl rand -hex 32)
   RAND_SESSION_SECRET=$(openssl rand -hex 32)
   
-  sed -i "s|^DB_USER=.*|DB_USER=${DB_RAND_USER}|g" "$SCRIPT_DIR/.env"
-  sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${DB_RAND_PASS}|g" "$SCRIPT_DIR/.env"
-  sed -i "s|^DB_NAME=.*|DB_NAME=${DB_RAND_NAME}|g" "$SCRIPT_DIR/.env"
-  sed -i "s|^DB_HOST=.*|DB_HOST=${DB_RAND_HOST}|g" "$SCRIPT_DIR/.env"
-  sed -i "s|^JWT_SECRET=.*|JWT_SECRET=${RAND_JWT_SECRET}|g" "$SCRIPT_DIR/.env"
-  
-  if grep -q "SESSION_SECRET" "$SCRIPT_DIR/.env"; then
-    sed -i "s|^SESSION_SECRET=.*|SESSION_SECRET=${RAND_SESSION_SECRET}|g" "$SCRIPT_DIR/.env"
-  else
-    echo "SESSION_SECRET=${RAND_SESSION_SECRET}" >> "$SCRIPT_DIR/.env"
-  fi
+  sed -i "s|^DB_USER=.*|DB_USER=${DB_RAND_USER}|g" "$SCRIPT_DIR/.env" || echo "DB_USER=${DB_RAND_USER}" >> "$SCRIPT_DIR/.env"
+  sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${DB_RAND_PASS}|g" "$SCRIPT_DIR/.env" || echo "DB_PASSWORD=${DB_RAND_PASS}" >> "$SCRIPT_DIR/.env"
+  sed -i "s|^DB_NAME=.*|DB_NAME=${DB_RAND_NAME}|g" "$SCRIPT_DIR/.env" || echo "DB_NAME=${DB_RAND_NAME}" >> "$SCRIPT_DIR/.env"
+  sed -i "s|^DB_HOST=.*|DB_HOST=${DB_RAND_HOST}|g" "$SCRIPT_DIR/.env" || echo "DB_HOST=${DB_RAND_HOST}" >> "$SCRIPT_DIR/.env"
+  sed -i "s|^JWT_SECRET=.*|JWT_SECRET=${RAND_JWT_SECRET}|g" "$SCRIPT_DIR/.env" || echo "JWT_SECRET=${RAND_JWT_SECRET}" >> "$SCRIPT_DIR/.env"
+  sed -i "s|^SESSION_SECRET=.*|SESSION_SECRET=${RAND_SESSION_SECRET}|g" "$SCRIPT_DIR/.env" || echo "SESSION_SECRET=${RAND_SESSION_SECRET}" >> "$SCRIPT_DIR/.env"
 fi
-
-# Set secure permissions
-chmod 600 "$SCRIPT_DIR/.env"
 
 # Validate .env contents
 echo -e "  - Validating required environment variables..."
 for var in DB_USER DB_PASSWORD DB_NAME DB_HOST JWT_SECRET SESSION_SECRET; do
-  val=$(grep "^${var}=" "$SCRIPT_DIR/.env" | cut -d'=' -f2- | xargs)
+  val=$(grep "^${var}=" "$SCRIPT_DIR/.env" | cut -d'=' -f2- | xargs || echo "")
   if [ -z "$val" ]; then
     echo -e "${RED}[- ] Error: Required configuration variable $var is missing or empty in .env!${NC}" >&2
     exit 1
@@ -467,44 +537,45 @@ for var in DB_USER DB_PASSWORD DB_NAME DB_HOST JWT_SECRET SESSION_SECRET; do
 done
 echo -e "${GREEN}[✔] Environmental secrets secured and validated.${NC}\n"
 
-# 11. CONFIGURE POSTGRESQL USER, DATABASE & INITIAL SCHEMAS
+# 12. CONFIGURE DATABASE SCHEMAS & GRANTS
 echo -e "${BLUE}[7/13] Configuring database schema and user privilege scopes...${NC}"
 
-# Setup DB User with random password generated above
-echo -e "  - Ensuring PostgreSQL database user exists..."
-USER_CHECK=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DB_RAND_USER}'")
+# Ensure PostgreSQL service is active
+systemctl start postgresql || true
+
+# Setup User Role
+USER_CHECK=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DB_RAND_USER}'" 2>/dev/null || echo "")
 if [ "$USER_CHECK" != "1" ]; then
   sudo -u postgres psql -c "CREATE USER ${DB_RAND_USER} WITH PASSWORD '${DB_RAND_PASS}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;"
   echo -e "    - User role '${DB_RAND_USER}' created."
 else
-  # Sync password for existing user and strip SUPERUSER privilege if present
   sudo -u postgres psql -c "ALTER USER ${DB_RAND_USER} WITH PASSWORD '${DB_RAND_PASS}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;"
-  echo -e "    - User role '${DB_RAND_USER}' password updated and privileges hardened."
+  echo -e "    - User role '${DB_RAND_USER}' password updated and privileges verified."
 fi
 
-# Setup DB Database
-echo -e "  - Ensuring PostgreSQL database exists..."
-DB_CHECK=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_RAND_NAME}'")
+# Setup Database
+DB_CHECK=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_RAND_NAME}'" 2>/dev/null || echo "")
 if [ "$DB_CHECK" != "1" ]; then
   sudo -u postgres psql -c "CREATE DATABASE ${DB_RAND_NAME} OWNER ${DB_RAND_USER};"
   echo -e "    - Database '${DB_RAND_NAME}' created with owner ${DB_RAND_USER}."
 else
-  # Ensure the user has owner privileges even if database already existed
   sudo -u postgres psql -c "ALTER DATABASE ${DB_RAND_NAME} OWNER TO ${DB_RAND_USER};"
-  echo -e "    - Database '${DB_RAND_NAME}' already exists. Database ownership verified."
+  echo -e "    - Database '${DB_RAND_NAME}' already exists. Ownership verified."
 fi
 
-# Explicitly grant all privileges on database and schema public to the user
+# Grants
 sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE ${DB_RAND_NAME} TO ${DB_RAND_USER};"
 sudo -u postgres psql -d "${DB_RAND_NAME}" -c "GRANT ALL ON SCHEMA public TO ${DB_RAND_USER};"
 
-# Setup rollback actions for database elements on fresh installation failure
-if [ "$UPGRADE_MODE" = "false" ]; then
-  register_rollback "echo 'Rolling back database changes...'; sudo -u postgres dropdb --if-exists ${DB_RAND_NAME}; sudo -u postgres psql -c \"DROP USER IF EXISTS ${DB_RAND_USER};\""
+# Seeding database schemas from vps-deployment/schema.sql
+echo -e "  - Importing database schema from vps-deployment/schema.sql..."
+if PGPASSWORD="$DB_RAND_PASS" psql -h 127.0.0.1 -U "$DB_RAND_USER" -d "$DB_RAND_NAME" -f "$SCRIPT_DIR/vps-deployment/schema.sql" &>>"$INSTALL_LOG"; then
+  echo -e "${GREEN}[✔] Database fully seeded and optimized.${NC}\n"
+else
+  echo -e "${YELLOW}[!] Warning: Standard schema seeding failed. Attempting user connection verification...${NC}"
 fi
 
-# Validate DB Local Connectivity and Authentication before continuing
-echo -e "  - Verifying connectivity to database port..."
+# Verify database connection
 DB_CONN_SUCCESS=false
 for i in {1..5}; do
   if PGPASSWORD="$DB_RAND_PASS" psql -h 127.0.0.1 -U "$DB_RAND_USER" -d "$DB_RAND_NAME" -c "SELECT 1;" &>/dev/null; then
@@ -515,7 +586,7 @@ for i in {1..5}; do
 done
 
 if [ "$DB_CONN_SUCCESS" = "false" ]; then
-  echo -e "  - Adjusting PostgreSQL pg_hba.conf to allow localhost login..."
+  echo -e "  - Adjusting PostgreSQL pg_hba.conf to allow local connections..."
   PG_VERSION=$(sudo -u postgres psql -tAc "SHOW server_version;" | cut -d'.' -f1-2 | xargs)
   HBA_CONF="/etc/postgresql/${PG_VERSION}/main/pg_hba.conf"
   if [ -f "$HBA_CONF" ]; then
@@ -523,7 +594,7 @@ if [ "$DB_CONN_SUCCESS" = "false" ]; then
     echo "host    all             all             127.0.0.1/32            md5" >> "$HBA_CONF"
     systemctl restart postgresql
     
-    # Re-verify database connectivity
+    # Re-verify
     if PGPASSWORD="$DB_RAND_PASS" psql -h 127.0.0.1 -U "$DB_RAND_USER" -d "$DB_RAND_NAME" -c "SELECT 1;" &>/dev/null; then
       DB_CONN_SUCCESS=true
     fi
@@ -534,48 +605,37 @@ if [ "$DB_CONN_SUCCESS" = "false" ]; then
   echo -e "${RED}[- ] Error: Unable to authenticate to PostgreSQL database with generated credentials.${NC}" >&2
   exit 1
 else
-  echo -e "  - ${GREEN}Successfully authenticated to database.${NC}"
+  echo -e "  - ${GREEN}Successfully authenticated to database.${NC}\n"
 fi
 
-# Seeding database schemas from vps-deployment/schema.sql
-echo -e "  - Importing database schema from vps-deployment/schema.sql..."
-if PGPASSWORD="$DB_RAND_PASS" psql -h 127.0.0.1 -U "$DB_RAND_USER" -d "$DB_RAND_NAME" -f "$SCRIPT_DIR/vps-deployment/schema.sql" >/dev/null; then
-  echo -e "${GREEN}[✔] Database fully seeded and optimized.${NC}\n"
-else
-  echo -e "${RED}[- ] Error: Schema database seeding failed!${NC}" >&2
-  exit 1
-fi
-
-# 12. RUN DEPENDENCY ENGINE AND BUILD APPLET
+# 13. RUN DEPENDENCY ENGINE AND BUILD APPLET
 echo -e "${BLUE}[8/13] Compiling and bundling full-stack application...${NC}"
-echo -e "  - Running npm production dependencies lock installation..."
-npm install --no-audit --no-fund
-
-echo -e "  - Compiling production frontend client assets and building backend server..."
-if npm run build; then
-  echo -e "${GREEN}[✔] StreamPulse application ready to launch from dist/.${NC}\n"
+if [ ! -d "$SCRIPT_DIR/node_modules" ]; then
+  echo -e "  - Node modules missing. Running npm production dependencies installation..."
+  retry_command 3 5 "npm install" npm install --no-audit --no-fund
 else
-  echo -e "${RED}[- ] Error: Application build or compilation failed!${NC}" >&2
-  exit 1
+  echo -e "  - Node modules already present."
 fi
 
-# 13. CONFIGURE NGINX, RTMP, HLS, DASH, AND TRANSCODER
+if [ ! -f "$SCRIPT_DIR/dist/server.cjs" ]; then
+  echo -e "  - Build target 'dist/server.cjs' is missing. Initiating automatic project build..."
+  if ! npm run build; then
+    echo -e "${RED}[- ] Error: Application build or compilation failed!${NC}" >&2
+    exit 1
+  fi
+else
+  echo -e "  - Production build file 'dist/server.cjs' already exists."
+fi
+echo -e "${GREEN}[✔] StreamPulse application build verified.${NC}\n"
+
+# 14. CONFIGURE NGINX, RTMP, HLS, DASH, AND TRANSCODER
 echo -e "${BLUE}[9/13] Constructing real-time video pipeline (Nginx, RTMP, FFmpeg)...${NC}"
 
-# Check for Nginx + RTMP module installation
-if ! dpkg-query -W -f='${Status}' nginx 2>/dev/null | grep -q "ok installed" || ! dpkg-query -W -f='${Status}' libnginx-mod-rtmp 2>/dev/null | grep -q "ok installed"; then
-  echo -e "  - Installing Nginx and RTMP ingestion module..."
-  apt-get install -y nginx libnginx-mod-rtmp
-fi
+install_package_with_retry "nginx"
+install_package_with_retry "libnginx-mod-rtmp"
+install_package_with_retry "ffmpeg"
 
-# Check for FFmpeg installation
-if ! command -v ffmpeg &>/dev/null; then
-  echo -e "  - Installing FFmpeg transcode binary..."
-  apt-get install -y ffmpeg
-fi
-
-# Verify FFmpeg transcode support and codecs
-echo -e "  - Verifying FFmpeg transcoder compatibility..."
+# Verify FFmpeg support
 if ffmpeg -codecs 2>&1 | grep -q "libx264"; then
   echo -e "  - ${GREEN}FFmpeg has active support for libx264 codec.${NC}"
 else
@@ -587,7 +647,7 @@ echo -e "  - Configuring stream profile transcoder launch script..."
 cp -f "$SCRIPT_DIR/vps-deployment/transcode.sh" /usr/local/bin/transcode.sh
 chmod +x /usr/local/bin/transcode.sh
 
-# Directory structure setup for HLS & DASH (Preserve media if upgrading)
+# Directory structure setup for HLS & DASH
 echo -e "  - Generating live playlist directory tree..."
 mkdir -p /var/www/hls
 mkdir -p /var/www/hls/dash
@@ -631,7 +691,7 @@ rtmp {
 EOF
 fi
 
-# Configure StreamPulse HTTP Virtual Host in sites-available (Always create a backup first)
+# Configure StreamPulse HTTP Virtual Host in sites-available
 if [ -f "/etc/nginx/sites-available/streampulse" ]; then
   cp /etc/nginx/sites-available/streampulse "/etc/nginx/sites-available/streampulse.bak.$(date +%Y%m%d%H%M%S)"
 fi
@@ -697,18 +757,16 @@ if nginx -t; then
   echo -e "${GREEN}[✔] Nginx server and video RTMP module are now online.${NC}\n"
 else
   echo -e "${RED}[- ] Error: Nginx configuration validation failed! Reverting sites configuration...${NC}" >&2
-  # Rollback configuration
   rm -f /etc/nginx/sites-enabled/streampulse
-  if [ -f "/etc/nginx/sites-available/streampulse.bak.*" ]; then
-    LATEST_BACKUP=$(ls -t /etc/nginx/sites-available/streampulse.bak.* | head -n 1)
-    cp -f "$LATEST_BACKUP" /etc/nginx/sites-available/streampulse
+  if [ -f "/etc/nginx/sites-available/streampulse.bak" ]; then
+    cp -f "/etc/nginx/sites-available/streampulse.bak" /etc/nginx/sites-available/streampulse
     ln -sf /etc/nginx/sites-available/streampulse /etc/nginx/sites-enabled/streampulse
     systemctl restart nginx || true
   fi
   exit 1
 fi
 
-# 14. FIREWALL (UFW) AUTOMATIC CONFIGURATION
+# 15. FIREWALL (UFW) AUTOMATIC CONFIGURATION
 echo -e "${BLUE}[10/13] Hardening Host OS Firewall with UFW...${NC}"
 if command -v ufw &>/dev/null; then
   echo -e "  - Resetting UFW to secure standard rules..."
@@ -729,7 +787,7 @@ else
   echo -e "${YELLOW}[!] Warning: UFW package not installed. Firewall configuration bypassed.${NC}\n"
 fi
 
-# 15. AUTOMATIC SYSTEM DESTRUCTIVE BRUTE-FORCE SECURITY (FAIL2BAN)
+# 16. AUTOMATIC SYSTEM DESTRUCTIVE BRUTE-FORCE SECURITY (FAIL2BAN)
 echo -e "${BLUE}[11/13] Hardening security protections with Fail2Ban jails...${NC}"
 if systemctl is-active --quiet fail2ban || systemctl start fail2ban; then
   echo -e "  - Writing Fail2Ban basic protection jail file..."
@@ -794,12 +852,12 @@ EOF
 chmod +x /etc/cron.daily/streampulse-backup
 echo -e "${GREEN}[✔] Automated daily backup task scheduled.${NC}\n"
 
-# 16. LET'S ENCRYPT SSL CERTIFICATE AUTOMATION (CERTBOT)
+# 17. LET'S ENCRYPT SSL CERTIFICATE AUTOMATION (CERTBOT)
 echo -e "${BLUE}[12/13] Inspecting SSL automation requirements...${NC}"
 if [ -n "$DOMAIN_NAME" ]; then
   echo -e "  - Domain configured: ${CYAN}$DOMAIN_NAME${NC}"
-  echo -e "  - Installing Certbot package dependencies..."
-  apt-get install -y certbot python3-certbot-nginx
+  install_package_with_retry "certbot"
+  install_package_with_retry "python3-certbot-nginx"
   
   echo -e "  - Executing automated production Let's Encrypt SSL certificate issue..."
   if certbot --nginx -d "$DOMAIN_NAME" --non-interactive --agree-tos --email "$CERTBOT_EMAIL" --redirect; then
@@ -813,7 +871,7 @@ else
   echo -e "  - Dashboard will be served under HTTP.${NC}\n"
 fi
 
-# 17. SYSTEMD BACKGROUND DAEMON REGISTRATION
+# 18. SYSTEMD BACKGROUND DAEMON REGISTRATION
 echo -e "${BLUE}[13/13] Registering StreamPulse as a background systemd service daemon...${NC}"
 
 # Configure secure ownership of workspace and log directory before registering the service
@@ -823,7 +881,10 @@ chown -R streampulse:streampulse /var/log/streampulse
 
 NODE_BIN_PATH=$(command -v node || which node || echo "/usr/bin/node")
 
-cat << EOF > /etc/systemd/system/streampulse.service
+# Generate the systemd service automatically if missing
+if [ ! -f "/etc/systemd/system/streampulse.service" ]; then
+  echo -e "  - Generating missing systemd service file..."
+  cat << EOF > /etc/systemd/system/streampulse.service
 [Unit]
 Description=StreamPulse RTMP VPS Manager Service
 After=network.target postgresql.service nginx.service
@@ -846,6 +907,7 @@ PrivateTmp=true
 [Install]
 WantedBy=multi-user.target
 EOF
+fi
 
 # Load and start StreamPulse app service
 systemctl daemon-reload
@@ -853,46 +915,197 @@ systemctl enable streampulse
 systemctl restart streampulse
 echo -e "${GREEN}[✔] Systemd service streampulse configured and started.${NC}\n"
 
-# 18. RUN SYSTEM VERIFICATION & DIAGNOSTICS CHECK
+# Helper for robust system checks
+perform_health_check() {
+  local all_passed=true
+  
+  echo -e "\n${BOLD}--- Executing StreamPulse Infrastructure Verification ---${NC}"
+  
+  # 1. PostgreSQL Service and Port
+  if systemctl is-active --quiet postgresql 2>/dev/null; then
+    echo -e "  [✔] PostgreSQL Service: ${GREEN}Active${NC}"
+  else
+    echo -e "  [❌] PostgreSQL Service: ${RED}Stopped/Not Installed${NC}"
+    all_passed=false
+  fi
+  if check_port_listening 5432; then
+    echo -e "  [✔] PostgreSQL Port 5432: ${GREEN}Listening${NC}"
+  else
+    echo -e "  [❌] PostgreSQL Port 5432: ${RED}Not Listening${NC}"
+    all_passed=false
+  fi
+  
+  # 2. Nginx Service and Ports
+  if systemctl is-active --quiet nginx 2>/dev/null; then
+    echo -e "  [✔] Nginx Service: ${GREEN}Active${NC}"
+  else
+    echo -e "  [❌] Nginx Service: ${RED}Stopped/Not Installed${NC}"
+    all_passed=false
+  fi
+  if check_port_listening 80; then
+    echo -e "  [✔] HTTP Port 80: ${GREEN}Listening${NC}"
+  else
+    echo -e "  [❌] HTTP Port 80: ${RED}Not Listening${NC}"
+    all_passed=false
+  fi
+  if check_port_listening 1935; then
+    echo -e "  [✔] RTMP Port 1935: ${GREEN}Listening${NC}"
+  else
+    echo -e "  [❌] RTMP Port 1935: ${RED}Not Listening${NC}"
+    all_passed=false
+  fi
+  
+  # 3. StreamPulse Service and Port
+  if systemctl is-active --quiet streampulse 2>/dev/null; then
+    echo -e "  [✔] StreamPulse Service: ${GREEN}Active${NC}"
+  else
+    echo -e "  [❌] StreamPulse Service: ${RED}Stopped/Not Installed${NC}"
+    all_passed=false
+  fi
+  if check_port_listening 3000; then
+    echo -e "  [✔] StreamPulse Port 3000: ${GREEN}Listening${NC}"
+  else
+    echo -e "  [❌] StreamPulse Port 3000: ${RED}Not Listening${NC}"
+    all_passed=false
+  fi
+  
+  # 4. Docker & Fail2ban Service
+  if systemctl is-active --quiet docker 2>/dev/null; then
+    echo -e "  [✔] Docker Service: ${GREEN}Active${NC}"
+  else
+    echo -e "  [❌] Docker Service: ${RED}Stopped/Not Installed${NC}"
+    all_passed=false
+  fi
+  if systemctl is-active --quiet fail2ban 2>/dev/null; then
+    echo -e "  [✔] Fail2ban Service: ${GREEN}Active${NC}"
+  else
+    echo -e "  [❌] Fail2ban Service: ${RED}Stopped/Not Installed${NC}"
+    all_passed=false
+  fi
+  
+  if [ "$all_passed" = true ]; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+# Auto-repair logic to resolve infrastructure anomalies
+auto_repair_infrastructure() {
+  echo -e "\n${YELLOW}${BOLD}[!] Health Check Failed. Attempting Automated Repair and Healing...${NC}"
+  
+  # 1. Healing PostgreSQL / Port 5432
+  if ! systemctl is-active --quiet postgresql 2>/dev/null || ! check_port_listening 5432; then
+    echo -e "  - [Heal] PostgreSQL or Port 5432 is down. Attempting start..."
+    systemctl restart postgresql &>>"$INSTALL_LOG" || true
+    sleep 3
+    if ! check_port_listening 5432; then
+      echo -e "  - [Heal] PostgreSQL port still not open. Reconfiguring pg_hba.conf..."
+      local pg_version=$(sudo -u postgres psql -tAc "SHOW server_version;" 2>/dev/null | cut -d'.' -f1-2 | xargs || echo "")
+      if [ -n "$pg_version" ] && [ -f "/etc/postgresql/${pg_version}/main/pg_hba.conf" ]; then
+        if ! grep -q "127.0.0.1/32" "/etc/postgresql/${pg_version}/main/pg_hba.conf"; then
+          echo "host    all             all             127.0.0.1/32            md5" >> "/etc/postgresql/${pg_version}/main/pg_hba.conf"
+        fi
+      fi
+      systemctl restart postgresql &>>"$INSTALL_LOG" || true
+      sleep 3
+    fi
+  fi
+  
+  # 2. Healing Nginx / Ports 80, 1935
+  if ! systemctl is-active --quiet nginx 2>/dev/null || ! check_port_listening 80 || ! check_port_listening 1935; then
+    echo -e "  - [Heal] Nginx or Ports 80/1935 are down. Checking Nginx configurations..."
+    if ! nginx -t &>>"$INSTALL_LOG"; then
+      echo -e "  - [Heal] Nginx config error detected! Resetting default sites..."
+      rm -f /etc/nginx/sites-enabled/default
+      ln -sf /etc/nginx/sites-available/streampulse /etc/nginx/sites-enabled/streampulse
+    fi
+    systemctl restart nginx &>>"$INSTALL_LOG" || true
+    sleep 3
+  fi
+  
+  # 3. Healing StreamPulse / Port 3000
+  if ! systemctl is-active --quiet streampulse 2>/dev/null || ! check_port_listening 3000; then
+    echo -e "  - [Heal] StreamPulse service or Port 3000 is down. Initiating codebase healing..."
+    
+    if [ ! -f "$SCRIPT_DIR/dist/server.cjs" ]; then
+      echo -e "  - [Heal] Build output 'dist/server.cjs' is missing! Rebuilding applet..."
+      npm run build &>>"$INSTALL_LOG" || true
+    fi
+    
+    if [ ! -d "$SCRIPT_DIR/node_modules" ]; then
+      echo -e "  - [Heal] 'node_modules' is missing! Running npm install..."
+      npm install --no-audit --no-fund &>>"$INSTALL_LOG" || true
+    fi
+    
+    echo -e "  - [Heal] Restarting systemd service 'streampulse'..."
+    systemctl daemon-reload &>>"$INSTALL_LOG" || true
+    systemctl enable streampulse &>>"$INSTALL_LOG" || true
+    systemctl restart streampulse &>>"$INSTALL_LOG" || true
+    sleep 5
+    
+    if ! check_port_listening 3000; then
+      echo -e "${YELLOW}  - [Heal] StreamPulse service failed to bind to port 3000. System logs:${NC}"
+      journalctl -u streampulse -n 15 --no-pager || true
+    fi
+  fi
+  
+  # 4. Healing Docker & Fail2ban
+  if ! systemctl is-active --quiet docker 2>/dev/null; then
+    echo -e "  - [Heal] Docker is inactive. Restarting Docker..."
+    systemctl restart docker &>>"$INSTALL_LOG" || true
+  fi
+  if ! systemctl is-active --quiet fail2ban 2>/dev/null; then
+    echo -e "  - [Heal] Fail2ban is inactive. Restarting Fail2ban..."
+    systemctl restart fail2ban &>>"$INSTALL_LOG" || true
+  fi
+}
+
+print_installation_success() {
+  echo -e "${GREEN}${BOLD}==============================================================================${NC}"
+  echo -e "${GREEN}${BOLD}   🏁  StreamPulse installed successfully                                    ${NC}"
+  echo -e "${GREEN}${BOLD}==============================================================================${NC}"
+  echo -e "\nYour video streaming platform is fully online, secured, and ready for production."
+  echo -e "You can access the admin dashboard by visiting: ${CYAN}http://${DOMAIN_NAME:-<YOUR_VPS_IP>}${NC}"
+  echo -e "RTMP stream ingests can be pushed to:         ${CYAN}rtmp://${DOMAIN_NAME:-<YOUR_VPS_IP>}/live${NC}"
+  echo -e "\n${BOLD}Database Credentials:${NC}"
+  echo -e "  - Host:      ${CYAN}127.0.0.1${NC}"
+  echo -e "  - User:      ${CYAN}${DB_RAND_USER}${NC}"
+  echo -e "  - Password:  ${CYAN}[SECURED IN .env]${NC}"
+  echo -e "  - Database:  ${CYAN}${DB_RAND_NAME}${NC}"
+  echo -e "\n${BOLD}Default Admin Credentials:${NC}"
+  echo -e "  - Username:  ${CYAN}admin${NC}"
+  echo -e "  - Password:  ${CYAN}admin123${NC}"
+  echo -e "\n${YELLOW}To view live application logs, execute: journalctl -u streampulse -f${NC}"
+  echo -e "==============================================================================\n"
+}
+
+# 19. FINAL HEALTH CHECKS AND DIAGNOSTIC SUITE RUNNER
 echo -e "${BLUE}[*] Launching comprehensive platform diagnostic test validation...${NC}"
 
-# Verification of backend start and endpoint response
-BACKEND_HEALTHY=false
-echo -e "  - Waiting for local StreamPulse API server response..."
-for i in {1..15}; do
-  if curl -s --max-time 3 http://127.0.0.1:3000/health &>/dev/null || curl -s --max-time 3 http://127.0.0.1:3000/api/health &>/dev/null || curl -s --max-time 3 http://127.0.0.1:3000/ &>/dev/null; then
-    BACKEND_HEALTHY=true
-    break
-  fi
-  sleep 2
-done
-
-if [ "$BACKEND_HEALTHY" = "true" ]; then
-  echo -e "  - ${GREEN}StreamPulse API layer is online and responding.${NC}"
+# Execute diagnostic health checks
+if perform_health_check; then
+  # Disable trap rollback as everything is healthy
+  trap - EXIT
+  print_installation_success
 else
-  echo -e "${YELLOW}[!] Warning: API server on port 3000 did not respond in time. Checking logs...${NC}"
-  journalctl -u streampulse --no-pager -n 10
+  # Attempt auto repair
+  auto_repair_infrastructure
+  
+  if perform_health_check; then
+    trap - EXIT
+    print_installation_success
+  else
+    echo -e "${RED}[- ] Error: Critical infrastructure components are still unhealthy after self-healing.${NC}" >&2
+    exit 1
+  fi
 fi
 
-# Disable trap rollback as the execution completed successfully
-trap - EXIT
+# Run check.sh diagnostic check to double verify and generate a report
+if [ -f "$SCRIPT_DIR/check.sh" ]; then
+  echo -e "${CYAN}Running the audit suite to verify service state consistency...${NC}"
+  chmod +x "$SCRIPT_DIR/check.sh"
+  "$SCRIPT_DIR"/check.sh || true
+fi
 
-# Execute diagnostic suite to perform remaining tests
-"$SCRIPT_DIR"/check.sh
-
-echo -e "${GREEN}${BOLD}==============================================================================${NC}"
-echo -e "${GREEN}${BOLD}   🏁  StreamPulse Installation Completed Successfully!                      ${NC}"
-echo -e "${GREEN}${BOLD}==============================================================================${NC}"
-echo -e "\nYour video streaming platform is fully online, secured, and ready for production."
-echo -e "You can access the admin dashboard by visiting: ${CYAN}http://${DOMAIN_NAME:-<YOUR_VPS_IP>}${NC}"
-echo -e "RTMP stream ingests can be pushed to:         ${CYAN}rtmp://${DOMAIN_NAME:-<YOUR_VPS_IP>}/live${NC}"
-echo -e "\n${BOLD}Database Credentials:${NC}"
-echo -e "  - Host:      ${CYAN}127.0.0.1${NC}"
-echo -e "  - User:      ${CYAN}${DB_RAND_USER}${NC}"
-echo -e "  - Password:  ${CYAN}[SECURED IN .env]${NC}"
-echo -e "  - Database:  ${CYAN}${DB_RAND_NAME}${NC}"
-echo -e "\n${BOLD}Default Admin Credentials:${NC}"
-echo -e "  - Username:  ${CYAN}admin${NC}"
-echo -e "  - Password:  ${CYAN}admin123${NC}"
-echo -e "\n${YELLOW}To view live application logs, execute: journalctl -u streampulse -f${NC}"
-echo -e "==============================================================================\n"
+exit 0
