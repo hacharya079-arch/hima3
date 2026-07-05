@@ -127,13 +127,11 @@ add_report() {
 }
 
 is_systemd_available() {
-  if [ "$ENV_MODE" = "Docker Container Mode" ] || [ "$ENV_MODE" = "Docker/LXC Container Mode" ]; then
-    return 1
-  fi
-  if command -v systemctl &>/dev/null && systemctl is-system-running &>/dev/null; then
-    return 0
-  elif command -v systemctl &>/dev/null && [ -d /run/systemd/system ]; then
-    return 0
+  if command -v systemctl &>/dev/null; then
+    # Test if systemctl can actively communicate with systemd manager
+    if systemctl list-units --type=service --no-legend &>/dev/null; then
+      return 0
+    fi
   fi
   return 1
 }
@@ -244,7 +242,7 @@ fi
 echo ""
 
 # ----------------------------------------------------
-# 3. DAEMON SERVICES DIAGNOSIS (SYSTEMD + FAILSAFE PROCESS TABLE LOOKUP)
+# 3. DAEMON SERVICES DIAGNOSIS (DYNAMIC & IDEMPOTENT)
 # ----------------------------------------------------
 print_section "3. Background Daemon Services Status"
 
@@ -288,400 +286,240 @@ is_process_running() {
   esac
 }
 
-# ----------------------------------------------------
-# 3.1 DYNAMIC SERVICE DETECTION LOGIC
-# ----------------------------------------------------
+get_all_systemd_services() {
+  # This returns a list of unique service unit names
+  {
+    systemctl list-unit-files --type=service --all --no-legend 2>/dev/null | awk '{print $1}'
+    systemctl list-units --type=service --all --no-legend 2>/dev/null | awk '{print $1}'
+  } | grep -E '\.service$' | sort -u
+}
 
-# --- A. StreamPulse Service Detection ---
-sp_units=()
-if is_systemd_available; then
-  # 1. Search name in unit files
-  while IFS= read -r line; do
-    if [ -n "$line" ]; then
-      sp_units+=("$line")
+find_streampulse_unit() {
+  if ! is_systemd_available; then echo ""; return 1; fi
+  
+  # Step 1: Look for any unit containing "streampulse" in its name
+  local match
+  match=$(get_all_systemd_services | grep -E -i 'streampulse' | head -n 1)
+  if [ -n "$match" ]; then
+    echo "$match"
+    return 0
+  fi
+  
+  # Step 2: Search by systemctl show properties matching ACTIVE_DIR or "streampulse"
+  local units
+  units=$(get_all_systemd_services)
+  for u in $units; do
+    # Skip standard system services to make this fast and efficient
+    if [[ "$u" =~ ^(systemd-|udev|dbus|getty|polkit|accounts-|apport|cron|ssh|rsyslog|multipath|lvm2|keyboard-|console-|kmod|unattended-upgrades) ]]; then
+      continue
     fi
-  done < <(systemctl list-unit-files --all --type=service 2>/dev/null | awk '{print $1}' | grep -E -i "streampulse" | grep -E "\.service$")
-
-  # 2. Search name in active/inactive units
-  while IFS= read -r line; do
-    if [ -n "$line" ] && [[ ! " ${sp_units[@]:-} " =~ " ${line} " ]]; then
-      sp_units+=("$line")
-    fi
-  done < <(systemctl list-units --all --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -E -i "streampulse" | grep -E "\.service$")
-
-  # 3. Scan physical systemd configuration directories for path references
-  local sysd_dirs=("/etc/systemd/system" "/lib/systemd/system" "/usr/lib/systemd/system" "/run/systemd/system")
-  for sdir in "${sysd_dirs[@]}"; do
-    if [ -d "$sdir" ]; then
-      while IFS= read -r sfile; do
-        if [ -f "$sfile" ]; then
-          local bname=$(basename "$sfile")
-          if [[ ! " ${sp_units[@]:-} " =~ " ${bname} " ]]; then
-            if [[ "$bname" == *"streampulse"* ]] || grep -q -E "ExecStart=.*streampulse|WorkingDirectory=.*streampulse|ExecStart=.*${ACTIVE_DIR}" "$sfile" 2>/dev/null; then
-              sp_units+=("$bname")
-            fi
-          fi
-        fi
-      done < <(find "$sdir" -maxdepth 2 -name "*.service" 2>/dev/null)
+    
+    local show_output
+    show_output=$(systemctl show -p ExecStart -p WorkingDirectory "$u" 2>/dev/null || echo "")
+    if [[ "$show_output" == *"$ACTIVE_DIR"* ]] || [[ "$show_output" == *"streampulse"* ]]; then
+      echo "$u"
+      return 0
     fi
   done
-fi
+  
+  echo ""
+  return 1
+}
 
-sp_installed=false
-sp_running=false
-sp_active_unit=""
+find_nginx_unit() {
+  if ! is_systemd_available; then echo ""; return 1; fi
+  get_all_systemd_services | grep -E -i '^nginx.*\.service$' | head -n 1
+}
 
-if [ ${#sp_units[@]} -gt 0 ]; then
-  sp_installed=true
-  for unit in "${sp_units[@]}"; do
-    if systemctl is-active --quiet "$unit" 2>/dev/null; then
-      sp_running=true
-      sp_active_unit="$unit"
-      break
-    fi
-  done
-  if [ "$sp_running" = "false" ]; then
-    sp_active_unit="${sp_units[0]}"
+find_postgres_unit() {
+  if ! is_systemd_available; then echo ""; return 1; fi
+  # Match exact postgresql.service first, then any postgresql@... or postgres...
+  local match
+  match=$(get_all_systemd_services | grep -E '^postgresql\.service$' | head -n 1)
+  if [ -n "$match" ]; then
+    echo "$match"
+    return 0
   fi
-fi
-
-if is_process_running "streampulse" || is_port_listening 3000; then
-  sp_installed=true
-  sp_running=true
-fi
-
-if [ "$sp_installed" = "false" ]; then
-  if [ -d "$ACTIVE_DIR" ] && { [ -f "$ACTIVE_DIR/package.json" ] || [ -f "$ACTIVE_DIR/server.ts" ] || [ -f "$ACTIVE_DIR/dist/server.cjs" ]; }; then
-    sp_installed=true
+  match=$(get_all_systemd_services | grep -E '^postgresql@.*\.service$' | head -n 1)
+  if [ -n "$match" ]; then
+    echo "$match"
+    return 0
   fi
-fi
+  get_all_systemd_services | grep -E -i '^postgre.*\.service$' | head -n 1
+}
 
+find_docker_unit() {
+  if ! is_systemd_available; then echo ""; return 1; fi
+  get_all_systemd_services | grep -E -i '^docker.*\.service$' | head -n 1
+}
 
-# --- B. Nginx Service Detection ---
-nginx_units=()
-if is_systemd_available; then
-  while IFS= read -r line; do
-    if [ -n "$line" ]; then
-      nginx_units+=("$line")
-    fi
-  done < <(systemctl list-unit-files --all --type=service 2>/dev/null | awk '{print $1}' | grep -E -i "^nginx\.service$")
+find_fail2ban_unit() {
+  if ! is_systemd_available; then echo ""; return 1; fi
+  get_all_systemd_services | grep -E -i '^fail2ban.*\.service$' | head -n 1
+}
 
-  while IFS= read -r line; do
-    if [ -n "$line" ] && [[ ! " ${nginx_units[@]:-} " =~ " ${line} " ]]; then
-      nginx_units+=("$line")
-    fi
-  done < <(systemctl list-units --all --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -E -i "^nginx\.service$")
-fi
-
+# Global installation flags
 nginx_installed=false
-nginx_running=false
-nginx_active_unit=""
-
-if [ ${#nginx_units[@]} -gt 0 ]; then
-  nginx_installed=true
-  for unit in "${nginx_units[@]}"; do
-    if systemctl is-active --quiet "$unit" 2>/dev/null; then
-      nginx_running=true
-      nginx_active_unit="$unit"
-      break
-    fi
-  done
-  if [ "$nginx_running" = "false" ]; then
-    nginx_active_unit="${nginx_units[0]}"
-  fi
-fi
-
-if is_process_running "nginx" || is_port_listening 80 || is_port_listening 443; then
-  nginx_installed=true
-  nginx_running=true
-fi
-
-if [ "$nginx_installed" = "false" ]; then
-  if [ -x "/usr/sbin/nginx" ] || [ -d "/etc/nginx" ]; then
-    nginx_installed=true
-  fi
-fi
-
-
-# --- C. PostgreSQL Service Detection ---
-pg_units=()
-if is_systemd_available; then
-  while IFS= read -r line; do
-    if [ -n "$line" ]; then
-      pg_units+=("$line")
-    fi
-  done < <(systemctl list-unit-files --all --type=service 2>/dev/null | awk '{print $1}' | grep -E -i "^postgresql(@.*)?\.service$|^postgres\.service$")
-
-  while IFS= read -r line; do
-    if [ -n "$line" ] && [[ ! " ${pg_units[@]:-} " =~ " ${line} " ]]; then
-      pg_units+=("$line")
-    fi
-  done < <(systemctl list-units --all --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -E -i "^postgresql(@.*)?\.service$|^postgres\.service$")
-fi
-
-# Fallback scan physical systemd directories for PostgreSQL units
-local pg_search_dirs=("/etc/systemd/system" "/lib/systemd/system" "/usr/lib/systemd/system")
-for sdir in "${pg_search_dirs[@]}"; do
-  if [ -d "$sdir" ]; then
-    while IFS= read -r sfile; do
-      local bname=$(basename "$sfile")
-      if [[ ! " ${pg_units[@]:-} " =~ " ${bname} " ]]; then
-        pg_units+=("$bname")
-      fi
-    done < <(find "$sdir" -maxdepth 2 -name "*postgresql*.service" -o -name "*postgres*.service" 2>/dev/null)
-  fi
-done
-
 pg_installed=false
-pg_running=false
-pg_active_unit=""
-
-if [ ${#pg_units[@]} -gt 0 ]; then
-  pg_installed=true
-  for unit in "${pg_units[@]}"; do
-    if systemctl is-active --quiet "$unit" 2>/dev/null; then
-      pg_running=true
-      pg_active_unit="$unit"
-      break
-    fi
-  done
-  if [ "$pg_running" = "false" ]; then
-    pg_active_unit="${pg_units[0]}"
-  fi
-fi
-
-if is_process_running "postgresql" || is_port_listening 5432; then
-  pg_installed=true
-  pg_running=true
-fi
-
-if [ "$pg_installed" = "false" ]; then
-  if [ -d "/etc/postgresql" ] || [ -d "/usr/lib/postgresql" ] || [ -d "/var/lib/postgresql" ]; then
-    pg_installed=true
-  fi
-fi
-
-
-# --- D. Fail2Ban Service Detection ---
-f2b_units=()
-if is_systemd_available; then
-  while IFS= read -r line; do
-    if [ -n "$line" ]; then
-      f2b_units+=("$line")
-    fi
-  done < <(systemctl list-unit-files --all --type=service 2>/dev/null | awk '{print $1}' | grep -E -i "^fail2ban\.service$")
-
-  while IFS= read -r line; do
-    if [ -n "$line" ] && [[ ! " ${f2b_units[@]:-} " =~ " ${line} " ]]; then
-      f2b_units+=("$line")
-    fi
-  done < <(systemctl list-units --all --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -E -i "^fail2ban\.service$")
-fi
-
+sp_installed=false
 f2b_installed=false
-f2b_running=false
-f2b_active_unit=""
-
-if [ ${#f2b_units[@]} -gt 0 ]; then
-  f2b_installed=true
-  for unit in "${f2b_units[@]}"; do
-    if systemctl is-active --quiet "$unit" 2>/dev/null; then
-      f2b_running=true
-      f2b_active_unit="$unit"
-      break
-    fi
-  done
-  if [ "$f2b_running" = "false" ]; then
-    f2b_active_unit="${f2b_units[0]}"
-  fi
-fi
-
-if is_process_running "fail2ban"; then
-  f2b_installed=true
-  f2b_running=true
-fi
-
-if [ "$f2b_installed" = "false" ]; then
-  if [ -x "/usr/bin/fail2ban-server" ] || [ -d "/etc/fail2ban" ]; then
-    f2b_installed=true
-  fi
-fi
-
-
-# --- E. Docker Service Detection ---
-docker_units=()
-if is_systemd_available; then
-  while IFS= read -r line; do
-    if [ -n "$line" ]; then
-      docker_units+=("$line")
-    fi
-  done < <(systemctl list-unit-files --all --type=service 2>/dev/null | awk '{print $1}' | grep -E -i "^docker\.service$")
-
-  while IFS= read -r line; do
-    if [ -n "$line" ] && [[ ! " ${docker_units[@]:-} " =~ " ${line} " ]]; then
-      docker_units+=("$line")
-    fi
-  done < <(systemctl list-units --all --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -E -i "^docker\.service$")
-fi
-
 docker_installed=false
-docker_running=false
-docker_active_unit=""
 
-if [ ${#docker_units[@]} -gt 0 ]; then
-  docker_installed=true
-  for unit in "${docker_units[@]}"; do
-    if systemctl is-active --quiet "$unit" 2>/dev/null; then
-      docker_running=true
-      docker_active_unit="$unit"
-      break
-    fi
-  done
-  if [ "$docker_running" = "false" ]; then
-    docker_active_unit="${docker_units[0]}"
-  fi
-fi
-
-if is_process_running "docker"; then
-  docker_installed=true
-  docker_running=true
-fi
-
-if [ "$docker_installed" = "false" ]; then
-  if command -v docker &>/dev/null || [ -d "/etc/docker" ]; then
-    docker_installed=true
-  fi
-fi
-
-
-# ----------------------------------------------------
-# 3.2 DAEMON SERVICE REPORTING (Failsafe & Idempotent)
-# ----------------------------------------------------
-
-# StreamPulse
-if [ "$sp_installed" = "true" ]; then
-  if [ "$sp_running" = "true" ]; then
-    local extra=""
-    if [ -n "$sp_active_unit" ]; then
-      local enabled="disabled"
-      if systemctl is-enabled --quiet "$sp_active_unit" 2>/dev/null; then
-        enabled="enabled"
+diagnose_system_service() {
+  local service_key="$1"
+  local display_name="$2"
+  local is_optional="$3"
+  
+  local installed=false
+  local running=false
+  local unit_name=""
+  local state_desc=""
+  local enabled_desc=""
+  
+  # Step 1: Detect via systemd if available
+  if is_systemd_available; then
+    case "$service_key" in
+      "streampulse") unit_name=$(find_streampulse_unit) ;;
+      "nginx")       unit_name=$(find_nginx_unit) ;;
+      "postgresql")  unit_name=$(find_postgres_unit) ;;
+      "docker")      unit_name=$(find_docker_unit) ;;
+      "fail2ban")    unit_name=$(find_fail2ban_unit) ;;
+    esac
+    
+    if [ -n "$unit_name" ]; then
+      installed=true
+      
+      # Query states reliably using systemctl show
+      local active_state
+      active_state=$(systemctl show -p ActiveState --value "$unit_name" 2>/dev/null || echo "unknown")
+      local sub_state
+      sub_state=$(systemctl show -p SubState --value "$unit_name" 2>/dev/null || echo "unknown")
+      
+      if [ "$active_state" = "active" ] || [ "$sub_state" = "running" ]; then
+        running=true
+        state_desc="RUNNING"
+      elif [ "$active_state" = "failed" ] || [ "$sub_state" = "failed" ]; then
+        state_desc="FAILED"
+      else
+        state_desc="INACTIVE"
       fi
-      extra=" (Systemd unit: $sp_active_unit, ${enabled} on boot)"
-    else
-      extra=" (Running via process/port discovery)"
+      
+      local enabled_state
+      enabled_state=$(systemctl is-enabled "$unit_name" 2>/dev/null || echo "unknown")
+      if [ "$enabled_state" = "enabled" ]; then
+        enabled_desc="Enabled on boot"
+      elif [ "$enabled_state" = "disabled" ]; then
+        enabled_desc="Disabled on boot"
+      elif [ "$enabled_state" = "masked" ]; then
+        enabled_desc="Masked"
+      else
+        enabled_desc="Status: $enabled_state"
+      fi
     fi
-    add_report "PASS" "StreamPulse API Manager Service" "RUNNING${extra}"
+  fi
+  
+  # Step 2: Fallback / Double check via Process Table or Ports
+  local proc_running=false
+  if is_process_running "$service_key"; then
+    proc_running=true
+    running=true
+    installed=true
+  fi
+  
+  # Port verification mapping for running state
+  case "$service_key" in
+    "nginx")
+      if is_port_listening 80 || is_port_listening 443; then
+        running=true; proc_running=true; installed=true
+      fi
+      ;;
+    "postgresql")
+      if is_port_listening 5432; then
+        running=true; proc_running=true; installed=true
+      fi
+      ;;
+    "streampulse")
+      if is_port_listening 3000; then
+        running=true; proc_running=true; installed=true
+      fi
+      ;;
+  esac
+  
+  # Step 3: Check package/binary presence if not found in systemd
+  if [ "$installed" = "false" ]; then
+    local physical_present=false
+    case "$service_key" in
+      "nginx")
+        if [ -x "/usr/sbin/nginx" ] || [ -d "/etc/nginx" ]; then physical_present=true; fi
+        ;;
+      "postgresql")
+        if [ -d "/usr/lib/postgresql" ] || [ -d "/etc/postgresql" ] || [ -d "/var/lib/postgresql" ]; then physical_present=true; fi
+        ;;
+      "streampulse")
+        if [ -d "$ACTIVE_DIR" ] && { [ -f "$ACTIVE_DIR/package.json" ] || [ -f "$ACTIVE_DIR/server.ts" ] || [ -f "$ACTIVE_DIR/dist/server.cjs" ]; }; then
+          physical_present=true
+        fi
+        ;;
+      "docker")
+        if command -v docker &>/dev/null || [ -d "/etc/docker" ]; then physical_present=true; fi
+        ;;
+      "fail2ban")
+        if [ -x "/usr/bin/fail2ban-server" ] || [ -d "/etc/fail2ban" ]; then physical_present=true; fi
+        ;;
+    esac
+    
+    if [ "$physical_present" = "true" ]; then
+      installed=true
+    fi
+  fi
+  
+  # Step 4: Set global installation flags
+  if [ "$installed" = "true" ]; then
+    case "$service_key" in
+      "streampulse") sp_installed=true ;;
+      "nginx")       nginx_installed=true ;;
+      "postgresql")  pg_installed=true ;;
+      "fail2ban")    f2b_installed=true ;;
+      "docker")      docker_installed=true ;;
+    esac
+  fi
+  
+  # Step 5: Add diagnostic reports
+  if [ "$installed" = "false" ]; then
+    add_report "SKIP" "$display_name Service" "SKIPPED (Not Installed)"
+    return 0
+  fi
+  
+  if [ "$running" = "true" ]; then
+    local extra=""
+    if [ -n "$unit_name" ]; then
+      extra=" (Systemd unit: $unit_name, $enabled_desc)"
+    else
+      extra=" (Running via Process/Port Table discovery)"
+    fi
+    add_report "PASS" "$display_name Service" "RUNNING${extra}"
   else
     local extra=""
-    if [ -n "$sp_active_unit" ]; then
-      extra=" (Systemd unit: $sp_active_unit)"
-    fi
-    add_report "FAIL" "StreamPulse API Manager Service" "INSTALLED BUT STOPPED${extra}"
-  fi
-else
-  add_report "SKIP" "StreamPulse API Manager Service" "SKIPPED (Not Installed)"
-fi
-
-# Nginx
-if [ "$nginx_installed" = "true" ]; then
-  if [ "$nginx_running" = "true" ]; then
-    local extra=""
-    if [ -n "$nginx_active_unit" ]; then
-      local enabled="disabled"
-      if systemctl is-enabled --quiet "$nginx_active_unit" 2>/dev/null; then
-        enabled="enabled"
-      fi
-      extra=" (Systemd unit: $nginx_active_unit, ${enabled} on boot)"
+    if [ -n "$unit_name" ]; then
+      extra=" (Systemd unit: $unit_name is $state_desc, $enabled_desc)"
     else
-      extra=" (Running via process/port discovery)"
+      extra=" (Binary/Code found, but stopped)"
     fi
-    add_report "PASS" "Nginx Web & RTMP Server Service" "RUNNING${extra}"
-  else
-    local extra=""
-    if [ -n "$nginx_active_unit" ]; then
-      extra=" (Systemd unit: $nginx_active_unit)"
-    fi
-    add_report "FAIL" "Nginx Web & RTMP Server Service" "INSTALLED BUT STOPPED${extra}"
-  fi
-else
-  add_report "SKIP" "Nginx Web & RTMP Server Service" "SKIPPED (Not Installed)"
-fi
-
-# PostgreSQL
-if [ "$pg_installed" = "true" ]; then
-  if [ "$pg_running" = "true" ]; then
-    local extra=""
-    if [ -n "$pg_active_unit" ]; then
-      local enabled="disabled"
-      if systemctl is-enabled --quiet "$pg_active_unit" 2>/dev/null; then
-        enabled="enabled"
-      fi
-      extra=" (Systemd unit: $pg_active_unit, ${enabled} on boot)"
+    
+    if [ "$is_optional" = "true" ]; then
+      add_report "WARN" "$display_name Service" "INSTALLED BUT STOPPED${extra} (Optional)"
     else
-      extra=" (Running via process/port discovery)"
+      add_report "FAIL" "$display_name Service" "INSTALLED BUT STOPPED${extra}"
     fi
-    add_report "PASS" "PostgreSQL Database Service" "RUNNING${extra}"
-  else
-    local extra=""
-    if [ -n "$pg_active_unit" ]; then
-      extra=" (Systemd unit: $pg_active_unit)"
-    fi
-    add_report "FAIL" "PostgreSQL Database Service" "INSTALLED BUT STOPPED${extra}"
   fi
-else
-  add_report "SKIP" "PostgreSQL Database Service" "SKIPPED (Not Installed)"
-fi
+}
 
-# Fail2Ban
-if [ "$f2b_installed" = "true" ]; then
-  if [ "$f2b_running" = "true" ]; then
-    local extra=""
-    if [ -n "$f2b_active_unit" ]; then
-      local enabled="disabled"
-      if systemctl is-enabled --quiet "$f2b_active_unit" 2>/dev/null; then
-        enabled="enabled"
-      fi
-      extra=" (Systemd unit: $f2b_active_unit, ${enabled} on boot)"
-    else
-      extra=" (Running via process discovery)"
-    fi
-    add_report "PASS" "Fail2Ban Protection Service" "RUNNING${extra}"
-  else
-    local extra=""
-    if [ -n "$f2b_active_unit" ]; then
-      extra=" (Systemd unit: $f2b_active_unit)"
-    fi
-    add_report "FAIL" "Fail2Ban Protection Service" "INSTALLED BUT STOPPED${extra}"
-  fi
-else
-  add_report "SKIP" "Fail2Ban Protection Service" "SKIPPED (Not Installed)"
-fi
-
-# Docker
-if [ "$docker_installed" = "true" ]; then
-  if [ "$docker_running" = "true" ]; then
-    local extra=""
-    if [ -n "$docker_active_unit" ]; then
-      local enabled="disabled"
-      if systemctl is-enabled --quiet "$docker_active_unit" 2>/dev/null; then
-        enabled="enabled"
-      fi
-      extra=" (Systemd unit: $docker_active_unit, ${enabled} on boot)"
-    else
-      extra=" (Running via process discovery)"
-    fi
-    add_report "PASS" "Docker Engine Service" "RUNNING${extra}"
-  else
-    local extra=""
-    if [ -n "$docker_active_unit" ]; then
-      extra=" (Systemd unit: $docker_active_unit)"
-    fi
-    add_report "FAIL" "Docker Engine Service" "INSTALLED BUT STOPPED${extra}"
-  fi
-else
-  add_report "SKIP" "Docker Engine Service" "SKIPPED (Not Installed)"
-fi
+# Run Service Diagnostics
+diagnose_system_service "streampulse" "StreamPulse API Manager" "false"
+diagnose_system_service "nginx" "Nginx Web & RTMP Server" "false"
+diagnose_system_service "postgresql" "PostgreSQL Database" "false"
+diagnose_system_service "fail2ban" "Fail2Ban Protection" "true"
+diagnose_system_service "docker" "Docker Engine" "true"
 echo ""
 
 # ----------------------------------------------------
@@ -726,10 +564,10 @@ if [ -f "$ACTIVE_DIR/.env" ]; then
   add_report "PASS" "Config File (.env)" "Found at $ACTIVE_DIR/.env"
   
   # Extract DB parameters cleanly, stripping out surrounding quotes
-  DB_USER=$(grep "^DB_USER=" "$ACTIVE_DIR/.env" | cut -d'=' -f2- | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
-  DB_PASSWORD=$(grep "^DB_PASSWORD=" "$ACTIVE_DIR/.env" | cut -d'=' -f2- | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
-  DB_NAME=$(grep "^DB_NAME=" "$ACTIVE_DIR/.env" | cut -d'=' -f2- | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
-  DB_HOST=$(grep "^DB_HOST=" "$ACTIVE_DIR/.env" | cut -d'=' -f2- | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+  DB_USER=$(grep "^DB_USER=" "$ACTIVE_DIR/.env" | cut -d'=' -f2- | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//" 2>/dev/null || echo "")
+  DB_PASSWORD=$(grep "^DB_PASSWORD=" "$ACTIVE_DIR/.env" | cut -d'=' -f2- | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//" 2>/dev/null || echo "")
+  DB_NAME=$(grep "^DB_NAME=" "$ACTIVE_DIR/.env" | cut -d'=' -f2- | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//" 2>/dev/null || echo "")
+  DB_HOST=$(grep "^DB_HOST=" "$ACTIVE_DIR/.env" | cut -d'=' -f2- | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//" 2>/dev/null || echo "")
   
   if [[ -n "$DB_USER" && -n "$DB_PASSWORD" && -n "$DB_NAME" && -n "$DB_HOST" ]]; then
     # Determine if database host is local vs remote
