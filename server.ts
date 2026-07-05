@@ -49,6 +49,26 @@ async function startServer() {
     res.json({ status: "ok" });
   });
 
+  // Support /api/status
+  app.get('/api/status', (req, res) => {
+    res.json({
+      status: "online",
+      database: db ? "connected" : "offline",
+      uptime: process.uptime(),
+      timestamp: new Date().toISOString()
+    });
+  });
+
+  // Support /api/version
+  app.get('/api/version', (req, res) => {
+    res.json({
+      version: "1.1.0",
+      environment: process.env.NODE_ENV || "development",
+      framework: "Express 5.x",
+      node: process.version
+    });
+  });
+
   // Serve HLS & DASH streams with proper CORS headers for player libraries
   const hlsPath = path.resolve('./data/hls');
   if (!fs.existsSync(hlsPath)) {
