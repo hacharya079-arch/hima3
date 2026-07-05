@@ -3,6 +3,7 @@
 # ==============================================================================
 # StreamPulse RTMP VPS Manager - High-Performance Platform Uninstaller
 # Supported OS: Ubuntu 20.04 LTS / 22.04 LTS / 24.04 LTS
+# Architect: Senior Linux DevOps & Production Reliability Engineer
 # ==============================================================================
 
 # Exit immediately if a command fails in an unexpected way
@@ -108,14 +109,17 @@ fi
 # Check if there is an Nginx backup config to restore
 NGINX_BACKUPS=$(ls /etc/nginx/nginx.conf.bak.* 2>/dev/null || true)
 if [ -n "$NGINX_BACKUPS" ]; then
-  LATEST_BACKUP=$(ls -t /etc/nginx/nginx.conf.bak.* | head -n 1)
-  echo -e "  - Restoring Nginx core backup: ${CYAN}$LATEST_BACKUP${NC}"
-  cp -f "$LATEST_BACKUP" /etc/nginx/nginx.conf
+  LATEST_BACKUP=$(ls -t /etc/nginx/nginx.conf.bak.* 2>/dev/null | head -n 1)
+  if [ -n "$LATEST_BACKUP" ] && [ -f "$LATEST_BACKUP" ]; then
+    echo -e "  - Restoring Nginx core backup: ${CYAN}$LATEST_BACKUP${NC}"
+    cp -f "$LATEST_BACKUP" /etc/nginx/nginx.conf
+  fi
 else
-  # If no backup, at least attempt to remove the RTMP block from nginx.conf
+  # Attempt to remove the RTMP block from nginx.conf if backup is not available
   if grep -q "rtmp {" /etc/nginx/nginx.conf; then
-    echo -e "  - RTMP block found in Nginx configuration. Restoring default if possible."
-    # We can advise user to reinstall nginx-light or we can leave it. To be safe, we let nginx know.
+    echo -e "  - RTMP block found in Nginx configuration. Removing..."
+    # A safe inline sed to remove block from rtmp { down to the closing bracket }
+    sed -i '/rtmp {/,/^}/d' /etc/nginx/nginx.conf || true
   fi
 fi
 
@@ -157,7 +161,6 @@ fi
 if [ "$PURGE_DB" = true ]; then
   echo -e "\n${BLUE}[*] Purging database schemas and admin roles from PostgreSQL...${NC}"
   
-  # Read credentials from local .env if available, stripping quotes
   DB_USER=""
   DB_NAME=""
   if [ -f "$ACTIVE_DIR/.env" ]; then

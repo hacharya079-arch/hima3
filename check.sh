@@ -138,15 +138,28 @@ print_section() {
 
 is_port_listening() {
   local port="$1"
+  local found=false
+  
+  set +e
   if command -v ss >/dev/null 2>&1; then
-    ss -tuln 2>/dev/null | grep -q -E "[:\s]${port}\s" && return 0
+    ss -tuln 2>/dev/null | grep -q -E "[:\s]${port}\s"
+    [ $? -eq 0 ] && found=true
   elif command -v netstat >/dev/null 2>&1; then
-    netstat -tuln 2>/dev/null | grep -q -E "[:\s]${port}\s" && return 0
+    netstat -tuln 2>/dev/null | grep -q -E "[:\s]${port}\s"
+    [ $? -eq 0 ] && found=true
   fi
-  if timeout 1 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" >/dev/null 2>&1; then
+  
+  if [ "$found" = "false" ]; then
+    timeout 1 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" >/dev/null 2>&1
+    [ $? -eq 0 ] && found=true
+  fi
+  set -e
+  
+  if [ "$found" = "true" ]; then
     return 0
+  else
+    return 1
   fi
-  return 1
 }
 
 get_env_val() {
@@ -314,161 +327,275 @@ check_runtimes() {
 get_systemd_units_for_service() {
   local service="$1"
   local matched_units=()
-  local all_units=""
   
-  if [ "$has_systemd" = "true" ]; then
-    local f; f=$(systemctl list-unit-files --type=service --all --no-legend 2>/dev/null | awk '{print $1}' || echo "")
-    local u; u=$(systemctl list-units --type=service --all --no-legend 2>/dev/null | awk '{print $1}' || echo "")
-    all_units=$(echo -e "${f}\n${u}" | sort -u | grep -v '^$' || true)
+  if [ "$has_systemd" = "false" ]; then
+    echo ""
+    return 0
   fi
-
-  if [ -n "$all_units" ]; then
-    local unit
-    while IFS= read -r unit; do
-      [ -z "$unit" ] && continue
-      local base="${unit%.service}"
-      local match=false
-      case "$service" in
-        "postgresql")
-          if [[ "$base" =~ ^postgresql(@[0-9a-zA-Z_-]+)?$ ]] || [[ "$base" == "postgres" ]]; then
-            match=true
-          fi
-          ;;
-        "streampulse")
-          if [[ "$base" =~ ^streampulse(-backend|-api)?(@[0-9a-zA-Z_-]+)?$ ]]; then
-            match=true
-          fi
-          ;;
-        "nginx")
-          if [[ "$base" == "nginx" ]]; then match=true; fi
-          ;;
-        "docker")
-          if [[ "$base" == "docker" ]]; then match=true; fi
-          ;;
-        "fail2ban")
-          if [[ "$base" == "fail2ban" ]]; then match=true; fi
-          ;;
-        *)
-          if [[ "$base" == "$service" ]]; then match=true; fi
-          ;;
-      esac
-      if [ "$match" = "true" ]; then
-        matched_units+=("$unit")
-      fi
-    done <<< "$all_units"
+  
+  # List all possible services via systemctl
+  # We do this by querying list-unit-files and list-units
+  local all_units
+  set +e
+  all_units=$( (systemctl list-unit-files --type=service --all --no-legend 2>/dev/null | awk '{print $1}' || echo ""; \
+                systemctl list-units --type=service --all --no-legend 2>/dev/null | awk '{print $1}' || echo "") | sort -u | grep -v '^$' || true)
+  set -e
+                
+  if [ -z "$all_units" ]; then
+    # Fallback to systemctl show directly on the service name
+    all_units="$service"
   fi
+  
+  local unit
+  while IFS= read -r unit; do
+    [ -z "$unit" ] && continue
+    local base="${unit%.service}"
+    local match=false
+    case "$service" in
+      "postgresql")
+        if [[ "$base" =~ ^postgresql(@[0-9a-zA-Z_-]+)?$ ]] || [[ "$base" == "postgres" ]]; then
+          match=true
+        fi
+        ;;
+      "streampulse")
+        if [[ "$base" =~ ^streampulse(-backend|-api)?(@[0-9a-zA-Z_-]+)?$ ]]; then
+          match=true
+        fi
+        ;;
+      "nginx")
+        if [[ "$base" == "nginx" ]]; then match=true; fi
+        ;;
+      "docker")
+        if [[ "$base" == "docker" ]]; then match=true; fi
+        ;;
+      "fail2ban")
+        if [[ "$base" == "fail2ban" ]]; then match=true; fi
+        ;;
+      *)
+        if [[ "$base" == "$service" ]]; then match=true; fi
+        ;;
+    esac
+    if [ "$match" = "true" ]; then
+      matched_units+=("$unit")
+    fi
+  done <<< "$all_units"
+  
   echo "${matched_units[@]:-}"
 }
 
 check_service_status() {
   local service_name="$1" is_required="$2"
-  local is_installed=false is_active=false is_enabled=false
-  local method="" extra="" pids=() checked=()
-
-  if [ "$has_systemd" = "true" ]; then
-    local matched; matched=$(get_systemd_units_for_service "$service_name")
-    if [ -n "$matched" ]; then
-      is_installed=true
-      method="systemd"
-      local unit
-      for unit in $matched; do
-        checked+=("$unit")
-        local active_status=false
-        if systemctl is-active --quiet "$unit" 2>/dev/null; then
-          active_status=true
-        fi
-        local status_out; status_out=$(systemctl status "$unit" 2>/dev/null || true)
-        if [ "$active_status" = "false" ] && echo "$status_out" | grep -q -E "Active: active \(running\)|\(running\)"; then
-          active_status=true
-        fi
-        local en; en=$(systemctl is-enabled "$unit" 2>/dev/null || echo "disabled")
-        if [ "$en" = "enabled" ] || [ "$en" = "enabled-runtime" ]; then
-          is_enabled=true
-        fi
-        if [ "$active_status" = "true" ]; then
-          is_active=true
-          local pid_val; pid_val=$(systemctl show "$unit" -p MainPID 2>/dev/null | cut -d= -f2 || echo "0")
-          if [ -n "$pid_val" ] && [[ "$pid_val" =~ ^[0-9]+$ ]] && [ "$pid_val" -gt 0 ] && kill -0 "$pid_val" 2>/dev/null; then
-            pids+=("$pid_val")
-          fi
-        fi
-      done
-      if [ "$is_active" = "false" ]; then
-        local fu; fu=$(echo "$matched" | awk '{print $1}')
-        local fe; fe=$(systemctl is-enabled "$fu" 2>/dev/null || echo "unknown")
-        extra="($fu is $fe, inactive)"
-      else
-        extra="(Active unit(s): ${checked[*]}, PID(s): ${pids[*]:-none})"
+  
+  # Initialize states
+  local is_installed=false
+  local is_active=false
+  local is_enabled=false
+  local method=""
+  local extra=""
+  local pids=()
+  local checked_units=()
+  
+  # 1. Query unit files & loaded units (Method 3, 4)
+  local matched_units; matched_units=$(get_systemd_units_for_service "$service_name" | xargs)
+  
+  # 2. Extract state using standard systemctl metrics (Method 1, 2, 5, 6)
+  if [ "$has_systemd" = "true" ] && [ -n "$matched_units" ]; then
+    is_installed=true
+    method="systemd"
+    
+    local unit
+    for unit in $matched_units; do
+      checked_units+=("$unit")
+      
+      # systemctl show (Method 1)
+      local load_state; load_state=$(systemctl show "$unit" -p LoadState 2>/dev/null | cut -d= -f2 || echo "")
+      local active_state; active_state=$(systemctl show "$unit" -p ActiveState 2>/dev/null | cut -d= -f2 || echo "")
+      local unit_file_state; unit_file_state=$(systemctl show "$unit" -p UnitFileState 2>/dev/null | cut -d= -f2 || echo "")
+      local main_pid; main_pid=$(systemctl show "$unit" -p MainPID 2>/dev/null | cut -d= -f2 || echo "")
+      
+      # systemctl status (Method 2)
+      local status_out; status_out=$(systemctl status "$unit" 2>/dev/null || true)
+      local status_says_active=false
+      if echo "$status_out" | grep -q -E "Active: active \(running\)|\(running\)"; then
+        status_says_active=true
       fi
+      
+      # systemctl is-active (Method 5)
+      local is_active_quiet=false
+      if systemctl is-active --quiet "$unit" 2>/dev/null; then
+        is_active_quiet=true
+      fi
+      
+      # systemctl is-enabled (Method 6)
+      local is_enabled_quiet=false
+      local en; en=$(systemctl is-enabled "$unit" 2>/dev/null || echo "disabled")
+      if [[ "$en" == "enabled" || "$en" == "enabled-runtime" || "$en" == "static" || "$en" == "alias" ]]; then
+        is_enabled_quiet=true
+      fi
+      
+      # Evaluate states
+      if [ "$active_state" = "active" ] || [ "$status_says_active" = "true" ] || [ "$is_active_quiet" = "true" ]; then
+        is_active=true
+        if [ -n "$main_pid" ] && [[ "$main_pid" =~ ^[0-9]+$ ]] && [ "$main_pid" -gt 0 ] && kill -0 "$main_pid" 2>/dev/null; then
+          pids+=("$main_pid")
+        fi
+      fi
+      
+      if [ "$is_enabled_quiet" = "true" ] || [ "$unit_file_state" = "enabled" ]; then
+        is_enabled=true
+      fi
+    done
+    
+    if [ "$is_active" = "true" ]; then
+      extra="(Active systemd unit(s): ${checked_units[*]}, PID(s): ${pids[*]:-none})"
+    else
+      extra="(Inactive systemd unit(s): ${checked_units[*]})"
     fi
   fi
-
-  if [ "$is_active" = "false" ]; then
-    local proc_running=false path_exists=false fallback_pids=()
-    case "$service_name" in
-      "streampulse")
-        local p; p=$(pgrep -f "dist/server\.cjs" || pgrep -f "server\.ts" || pgrep -f "streampulse" || echo "")
-        if [ -n "$p" ]; then
-          proc_running=true
-          for pid in $p; do if kill -0 "$pid" 2>/dev/null; then fallback_pids+=("$pid"); fi; done
-        fi
-        if [ -d "$ACTIVE_DIR" ] && { [ -f "$ACTIVE_DIR/package.json" ] || [ -f "$ACTIVE_DIR/dist/server.cjs" ]; }; then path_exists=true; fi
-        ;;
-      "nginx")
-        local p; p=$(pgrep -x nginx || pidof nginx || echo "")
-        if [ -n "$p" ]; then
-          proc_running=true
-          for pid in $p; do if kill -0 "$pid" 2>/dev/null; then fallback_pids+=("$pid"); fi; done
-        fi
-        if [ -d "/etc/nginx" ] || command -v nginx >/dev/null 2>&1; then path_exists=true; fi
-        ;;
-      "postgresql")
-        local p; p=$(pgrep -x postgres || pgrep -x postmaster || echo "")
-        if [ -n "$p" ]; then
-          proc_running=true
-          for pid in $p; do if kill -0 "$pid" 2>/dev/null; then fallback_pids+=("$pid"); fi; done
-        fi
-        if [ -d "/etc/postgresql" ] || [ -d "/var/lib/postgresql" ] || command -v psql >/dev/null 2>&1; then path_exists=true; fi
-        ;;
-      "docker")
-        local p; p=$(pgrep -x dockerd || echo "")
-        if [ -n "$p" ] || [ -S "/var/run/docker.sock" ]; then
-          proc_running=true
-          for pid in $p; do if kill -0 "$pid" 2>/dev/null; then fallback_pids+=("$pid"); fi; done
-        fi
-        if command -v docker >/dev/null 2>&1; then path_exists=true; fi
-        ;;
-      "fail2ban")
-        local p; p=$(pgrep -f fail2ban || echo "")
-        if [ -n "$p" ] || [ -S "/var/run/fail2ban/fail2ban.sock" ]; then
-          proc_running=true
-          for pid in $p; do if kill -0 "$pid" 2>/dev/null; then fallback_pids+=("$pid"); fi; done
-        fi
-        if [ -d "/etc/fail2ban" ] || command -v fail2ban-client >/dev/null 2>&1; then path_exists=true; fi
-        ;;
-    esac
-
-    if [ "$proc_running" = "true" ] && [ ${#fallback_pids[@]} -gt 0 ]; then
-      is_installed=true
-      is_active=true
-      pids=("${fallback_pids[@]}")
-      method="Process/Socket Discovery"
-      extra="(PID(s): ${pids[*]:-none})"
-    elif [ "$path_exists" = "true" ]; then
-      is_installed=true
-      if [ "$has_systemd" = "false" ]; then method="File Paths"; extra="(Inactive)"; fi
-    fi
+  
+  # 3. Process Discovery (Method 7) & Socket/Port validation (Method 8) as robust fallbacks
+  local proc_running=false
+  local socket_or_port_ok=false
+  local fallback_pids=()
+  
+  case "$service_name" in
+    "streampulse")
+      set +e
+      local p; p=$(pgrep -f "dist/server\.cjs" || pgrep -f "server\.ts" || pgrep -f "streampulse" || echo "")
+      set -e
+      if [ -n "$p" ]; then
+        proc_running=true
+        for pid in $p; do
+          if kill -0 "$pid" 2>/dev/null; then fallback_pids+=("$pid"); fi
+        done
+      fi
+      
+      local sp_port="3000"
+      local env_path="$ACTIVE_DIR/.env"
+      if [ -f "$env_path" ]; then
+        sp_port=$(get_env_val "PORT" "$env_path" "3000")
+      fi
+      if is_port_listening "$sp_port"; then
+        socket_or_port_ok=true
+      fi
+      ;;
+      
+    "nginx")
+      set +e
+      local p; p=$(pgrep -x nginx || pidof nginx || echo "")
+      set -e
+      if [ -n "$p" ]; then
+        proc_running=true
+        for pid in $p; do
+          if kill -0 "$pid" 2>/dev/null; then fallback_pids+=("$pid"); fi
+        done
+      fi
+      
+      if is_port_listening 80 || is_port_listening 443 || is_port_listening 1935; then
+        socket_or_port_ok=true
+      fi
+      ;;
+      
+    "postgresql")
+      set +e
+      local p; p=$(pgrep -x postgres || pgrep -x postmaster || echo "")
+      set -e
+      if [ -n "$p" ]; then
+        proc_running=true
+        for pid in $p; do
+          if kill -0 "$pid" 2>/dev/null; then fallback_pids+=("$pid"); fi
+        done
+      fi
+      
+      if is_port_listening 5432; then
+        socket_or_port_ok=true
+      elif [ -d "/var/run/postgresql" ] && [ -n "$(find /var/run/postgresql/ -name ".s.PGSQL.*" 2>/dev/null)" ]; then
+        socket_or_port_ok=true
+      fi
+      ;;
+      
+    "docker")
+      set +e
+      local p; p=$(pgrep -x dockerd || echo "")
+      set -e
+      if [ -n "$p" ]; then
+        proc_running=true
+        for pid in $p; do
+          if kill -0 "$pid" 2>/dev/null; then fallback_pids+=("$pid"); fi
+        done
+      fi
+      
+      if [ -S "/var/run/docker.sock" ] || [ -S "/var/run/docker-bootstrap.sock" ]; then
+        socket_or_port_ok=true
+      fi
+      ;;
+      
+    "fail2ban")
+      set +e
+      local p; p=$(pgrep -f fail2ban-server || pgrep -f fail2ban || echo "")
+      set -e
+      if [ -n "$p" ]; then
+        proc_running=true
+        for pid in $p; do
+          if kill -0 "$pid" 2>/dev/null; then fallback_pids+=("$pid"); fi
+        done
+      fi
+      
+      if [ -S "/var/run/fail2ban/fail2ban.sock" ]; then
+        socket_or_port_ok=true
+      fi
+      ;;
+  esac
+  
+  # Merge systemd and process/socket findings
+  # If systemd is inactive or absent but we found a running process or socket,
+  # override status to installed & active to eliminate container/VM false-positives!
+  if [ "$is_active" = "false" ] && { [ "$proc_running" = "true" ] || [ "$socket_or_port_ok" = "true" ]; }; then
+    is_installed=true
+    is_active=true
+    pids=("${fallback_pids[@]}")
+    method="Process/Socket Discovery"
+    extra="(PID(s): ${pids[*]:-none}, Listening Socket/Port: $socket_or_port_ok)"
   fi
-
+  
+  # Also, check if file structures exist to determine if installed (Method 3 fallback)
+  local path_exists=false
+  case "$service_name" in
+    "streampulse")
+      if [ -d "$ACTIVE_DIR" ] && { [ -f "$ACTIVE_DIR/package.json" ] || [ -f "$ACTIVE_DIR/dist/server.cjs" ]; }; then path_exists=true; fi
+      ;;
+    "nginx")
+      if [ -d "/etc/nginx" ] || command -v nginx >/dev/null 2>&1; then path_exists=true; fi
+      ;;
+    "postgresql")
+      if [ -d "/etc/postgresql" ] || [ -d "/var/lib/postgresql" ] || command -v psql >/dev/null 2>&1; then path_exists=true; fi
+      ;;
+    "docker")
+      if command -v docker >/dev/null 2>&1; then path_exists=true; fi
+      ;;
+    "fail2ban")
+      if [ -d "/etc/fail2ban" ] || command -v fail2ban-client >/dev/null 2>&1; then path_exists=true; fi
+      ;;
+  esac
+  
+  if [ "$is_installed" = "false" ] && [ "$path_exists" = "true" ]; then
+    is_installed=true
+    method="File Paths"
+    extra="(Inactive)"
+  fi
+  
+  # Final Reporting
   if [ "$is_installed" = "false" ]; then
     if [ "$is_required" = "true" ]; then
       add_report "FAIL" "Service: $service_name" "Service is NOT installed on the host"
-      add_remediation "Install $service_name" "Please install $service_name using the system package manager."
+      add_remediation "Install $service_name" "Please install $service_name using the system package manager or installer."
     else
       add_report "SKIP" "Service: $service_name" "Service is not installed (Optional)"
     fi
   elif [ "$is_active" = "true" ]; then
-    add_report "PASS" "Service: $service_name" "Service is running & healthy (Method: $method, $extra)"
+    local enabled_str="Enabled: $is_enabled"
+    if [ "$has_systemd" = "false" ]; then enabled_str="Systemd not active"; fi
+    add_report "PASS" "Service: $service_name" "Service is running & healthy ($enabled_str, Method: $method, $extra)"
   else
     if [ "$is_required" = "true" ]; then
       add_report "FAIL" "Service: $service_name" "Service is installed but INACTIVE $extra"
@@ -577,9 +704,12 @@ check_config_and_db() {
   fi
 
   local db_conn_ok=false
-  if ( set +e; PGPASSWORD="$db_password" timeout 3 psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" -c "SELECT 1;" >/dev/null 2>&1; exit $? ); then
+  set +e
+  PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" -c "SELECT 1;" >/dev/null 2>&1
+  if [ $? -eq 0 ]; then
     db_conn_ok=true
   fi
+  set -e
 
   if [ "$db_conn_ok" = "false" ]; then
     add_report "FAIL" "PostgreSQL Socket Connect" "Connectivity failed to PostgreSQL server ($db_name@$db_host:$db_port)"
@@ -589,12 +719,16 @@ check_config_and_db() {
   add_report "PASS" "PostgreSQL Socket Connect" "Successfully authenticated & connected to database"
 
   local users_ok=false streams_ok=false
-  if ( set +e; PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" -tAc "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema='public' AND table_name='users');" 2>/dev/null | grep -q "t"; exit $? ); then
+  set +e
+  PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" -tAc "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema='public' AND table_name='users');" 2>/dev/null | grep -q "t"
+  if [ $? -eq 0 ]; then
     users_ok=true
   fi
-  if ( set +e; PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" -tAc "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema='public' AND table_name='streams');" 2>/dev/null | grep -q "t"; exit $? ); then
+  PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" -tAc "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema='public' AND table_name='streams');" 2>/dev/null | grep -q "t"
+  if [ $? -eq 0 ]; then
     streams_ok=true
   fi
+  set -e
 
   if [ "$users_ok" = "true" ] && [ "$streams_ok" = "true" ]; then
     add_report "PASS" "Database Schema" "Production schema validated. Tables 'users' and 'streams' are intact"
@@ -628,11 +762,11 @@ check_filesystem() {
       add_report "PASS" "Log Storage Path" "Directory $log_dir exists and is writable"
     else
       add_report "FAIL" "Log Storage Path" "Directory $log_dir exists but is NOT writable"
-      add_remediation "Fix Log Permissions" "sudo chown -R \$(whoami):\$(whoami) $log_dir && sudo chmod -R 755 $log_dir"
+      add_remediation "Fix Log Permissions" "sudo chown -R streampulse:streampulse $log_dir && sudo chmod -R 755 $log_dir"
     fi
   else
     add_report "FAIL" "Log Storage Path" "Directory $log_dir is missing"
-    add_remediation "Create Log Storage Path" "sudo mkdir -p $log_dir && sudo chown -R \$(whoami):\$(whoami) $log_dir && sudo chmod -R 755 $log_dir"
+    add_remediation "Create Log Storage Path" "sudo mkdir -p $log_dir && sudo chown -R streampulse:streampulse $log_dir && sudo chmod -R 755 $log_dir"
   fi
 
   if [ -d "$data_dir" ]; then
@@ -736,19 +870,28 @@ check_api_endpoint() {
     return 0
   fi
 
-  local http_code="000" payload=""
+  local http_code="000"
+  local payload=""
   local url="http://127.0.0.1:$port/health"
-  local curl_resp; curl_resp=$(set +e; curl -s -w "\n%{http_code}" --max-time 3 "$url" 2>/dev/null; exit 0)
   
-  if [ -n "$curl_resp" ]; then
+  set +e
+  local curl_resp; curl_resp=$(curl -s -w "\n%{http_code}" --max-time 3 "$url" 2>/dev/null)
+  local curl_exit_code=$?
+  set -e
+  
+  if [ $curl_exit_code -eq 0 ] && [ -n "$curl_resp" ]; then
     http_code=$(echo "$curl_resp" | tail -n 1)
     payload=$(echo "$curl_resp" | head -n -1)
   fi
 
   if [ "$http_code" != "200" ] || [[ "$payload" != *"status"* ]]; then
     local fallback_url="http://127.0.0.1:$port/api/health"
-    local fb_resp; fb_resp=$(set +e; curl -s -w "\n%{http_code}" --max-time 3 "$fallback_url" 2>/dev/null; exit 0)
-    if [ -n "$fb_resp" ]; then
+    set +e
+    local fb_resp; fb_resp=$(curl -s -w "\n%{http_code}" --max-time 3 "$fallback_url" 2>/dev/null)
+    local fb_exit_code=$?
+    set -e
+    
+    if [ $fb_exit_code -eq 0 ] && [ -n "$fb_resp" ]; then
       local fb_code; fb_code=$(echo "$fb_resp" | tail -n 1)
       if [ "$fb_code" = "200" ]; then
         payload=$(echo "$fb_resp" | head -n -1)

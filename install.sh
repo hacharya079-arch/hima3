@@ -59,6 +59,360 @@ echo -e "${CYAN}================================================================
 # Define rollback array to register cleanup tasks on failure
 declare -a ROLLBACK_ACTIONS
 
+# ==============================================================================
+# CORE HELPER & SELF-HEALING UTILITIES (DEFINED EARLY TO PREVENT TRAP ERRORS)
+# ==============================================================================
+
+# Log detailed command failure
+log_failure() {
+  local exit_code="$1"
+  local cmd="$2"
+  local remediation="$3"
+  local timestamp; timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+  echo -e "\n${RED}[ERROR] Command failed at $timestamp${NC}" >&2
+  echo -e "${RED}  - Command:      $cmd${NC}" >&2
+  echo -e "${RED}  - Exit Code:    $exit_code${NC}" >&2
+  echo -e "${RED}  - Remediation:  $remediation${NC}\n" >&2
+  
+  {
+    echo "=========================================="
+    echo "TIMESTAMP:   $timestamp"
+    echo "COMMAND:     $cmd"
+    echo "EXIT CODE:   $exit_code"
+    echo "REMEDIATION: $remediation"
+    echo "=========================================="
+  } >> "$ERROR_LOG"
+}
+
+# Command retry wrapper helper function
+retry_command() {
+  local max_attempts="$1"
+  local delay="$2"
+  local description="$3"
+  local remediation="$4"
+  shift 4
+  local cmd="$*"
+  local attempt=1
+  while [ $attempt -le $max_attempts ]; do
+    echo -e "  - [Attempt $attempt/$max_attempts] $description..."
+    local exit_code=0
+    set +e
+    eval "$cmd" >> "$INSTALL_LOG" 2>> "$ERROR_LOG"
+    exit_code=$?
+    set -e
+    if [ $exit_code -eq 0 ]; then
+      return 0
+    fi
+    echo -e "${YELLOW}  - Warning: $description failed. Retrying in $delay seconds...${NC}"
+    sleep "$delay"
+    attempt=$((attempt+1))
+  done
+  log_failure "$exit_code" "$cmd" "$remediation"
+  return 1
+}
+
+# Helper to check if a port is listening
+check_port_listening() {
+  local port="$1"
+  if command -v ss &>/dev/null; then
+    ss -tuln | grep -q -E ":$port\s" && return 0
+  elif command -v netstat &>/dev/null; then
+    netstat -tuln | grep -q -E ":$port\s" && return 0
+  else
+    local hex_port=$(printf '%04X' "$port" 2>/dev/null || echo "")
+    if [ -n "$hex_port" ] && [ -f "/proc/net/tcp" ]; then
+      grep -q -i ":$hex_port" /proc/net/tcp 2>/dev/null && return 0
+    fi
+  fi
+  return 1
+}
+
+# Audit APT repositories for duplicates and malformed entries
+validate_apt_repositories() {
+  echo -e "[*] Auditing APT repositories for syntax errors and duplicates..."
+  local seen_repos_file; seen_repos_file=$(mktemp)
+  
+  # Remove corrupted docker.list automatically
+  if [ -f "/etc/apt/sources.list.d/docker.list" ]; then
+    if ! grep -q "download.docker.com" /etc/apt/sources.list.d/docker.list 2>/dev/null; then
+      echo -e "${YELLOW}[!] Corrupt /etc/apt/sources.list.d/docker.list detected. Automatically removing...${NC}"
+      rm -f /etc/apt/sources.list.d/docker.list
+    fi
+  fi
+
+  local files=("/etc/apt/sources.list")
+  if [ -d "/etc/apt/sources.list.d" ]; then
+    while IFS= read -r -d '' file; do
+      files+=("$file")
+    done < <(find /etc/apt/sources.list.d -name "*.list" -print0 2>/dev/null)
+  fi
+
+  for file in "${files[@]}"; do
+    [ ! -f "$file" ] && continue
+    local temp_file; temp_file=$(mktemp)
+    local file_changed=false
+    
+    while IFS= read -r line || [ -n "$line" ]; do
+      local trimmed; trimmed=$(echo "$line" | xargs)
+      if [ -z "$trimmed" ] || [[ "$trimmed" =~ ^# ]]; then
+        echo "$line" >> "$temp_file"
+        continue
+      fi
+      
+      # 1. Syntax Validation
+      local is_valid=true
+      if [[ ! "$trimmed" =~ ^deb(-src)?[[:space:]]+(\[[^]]+\][[:space:]]+)?[a-zA-Z0-9_+.-]+://[^[:space:]]+[[:space:]]+[^[:space:]]+([[:space:]]+[^[:space:]]+)*$ ]]; then
+        is_valid=false
+      fi
+      
+      if [ "$is_valid" = "false" ]; then
+        echo -e "${YELLOW}[!] Malformed APT entry in $file. Neutralizing: $trimmed${NC}"
+        echo "# REPAIRED: $line" >> "$temp_file"
+        file_changed=true
+        continue
+      fi
+      
+      # 2. Duplicate Detection
+      local normalized; normalized=$(echo "$trimmed" | sed -E 's/\[[^]]+\]//g' | tr -d '[:space:]' | sed 's/\/$//')
+      if grep -Fxq "$normalized" "$seen_repos_file" 2>/dev/null; then
+        echo -e "${YELLOW}[!] Duplicate APT entry detected and deactivated: $trimmed${NC}"
+        echo "# DUPLICATE: $line" >> "$temp_file"
+        file_changed=true
+        continue
+      fi
+      
+      echo "$normalized" >> "$seen_repos_file"
+      echo "$line" >> "$temp_file"
+    done < "$file"
+    
+    if [ "$file_changed" = "true" ]; then
+      cp "$file" "$file.bak.$(date +%Y%m%d%H%M%S)" || true
+      cat "$temp_file" > "$file"
+    fi
+    rm -f "$temp_file"
+  done
+  
+  rm -f "$seen_repos_file"
+}
+
+# Safe apt update runner
+safe_apt_update() {
+  validate_apt_repositories
+  echo -e "  - Syncing system package repositories..."
+  if ! retry_command 3 5 "apt-get update" "Run apt-get update manually to fix index issues." "apt-get update -y"; then
+    echo -e "${RED}[- ] Error: apt-get update failed even after validations and retries.${NC}" >&2
+    exit 1
+  fi
+}
+
+# Helper for package installation
+is_package_installed() {
+  dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "ok installed"
+}
+
+install_package_with_retry() {
+  local pkg="$1"
+  if is_package_installed "$pkg"; then
+    echo -e "  - ${GREEN}$pkg${NC} is already installed."
+    return 0
+  fi
+  
+  retry_command 3 4 "Installing $pkg via apt" "Check network connectivity or run sudo apt-get install -y $pkg" "apt-get install -y $pkg"
+}
+
+# Print success output
+print_installation_success() {
+  echo -e "${GREEN}${BOLD}==============================================================================${NC}"
+  echo -e "${GREEN}${BOLD}   🏁  StreamPulse installed successfully                                    ${NC}"
+  echo -e "${GREEN}${BOLD}==============================================================================${NC}"
+  echo -e "\nYour video streaming platform is fully online, secured, and ready for production."
+  echo -e "You can access the admin dashboard by visiting: ${CYAN}http://${DOMAIN_NAME:-<YOUR_VPS_IP>}${NC}"
+  echo -e "RTMP stream ingests can be pushed to:         ${CYAN}rtmp://${DOMAIN_NAME:-<YOUR_VPS_IP>}/live${NC}"
+  echo -e "\n${BOLD}Database Credentials:${NC}"
+  echo -e "  - Host:      ${CYAN}127.0.0.1${NC}"
+  echo -e "  - User:      ${CYAN}${DB_RAND_USER:-streampulse_admin}${NC}"
+  echo -e "  - Password:  ${CYAN}[SECURED IN .env]${NC}"
+  echo -e "  - Database:  ${CYAN}${DB_RAND_NAME:-streampulse}${NC}"
+  echo -e "\n${BOLD}Default Admin Credentials:${NC}"
+  echo -e "  - Username:  ${CYAN}admin${NC}"
+  echo -e "  - Password:  ${CYAN}admin123${NC}"
+  echo -e "\n${YELLOW}To view live application logs, execute: journalctl -u streampulse -f${NC}"
+  echo -e "==============================================================================\n"
+}
+
+# Comprehensive Production Health and Diagnostic Checks
+perform_health_check() {
+  local all_passed=true
+  
+  echo -e "\n${BOLD}--- Executing StreamPulse Production Verification ---${NC}"
+  
+  # 1. Directory Checks
+  if [ -d "/var/www/hls" ] && [ -w "/var/www/hls" ]; then
+    echo -e "  [✔] HLS Directory (/var/www/hls): ${GREEN}Exists & Writable${NC}"
+  else
+    echo -e "  [❌] HLS Directory (/var/www/hls): ${RED}Missing or Not Writable${NC}"
+    all_passed=false
+  fi
+  
+  if [ -d "/var/log/streampulse" ] && [ -w "/var/log/streampulse" ]; then
+    echo -e "  [✔] Log Directory (/var/log/streampulse): ${GREEN}Exists & Writable${NC}"
+  else
+    echo -e "  [❌] Log Directory (/var/log/streampulse): ${RED}Missing or Not Writable${NC}"
+    all_passed=false
+  fi
+  
+  # 2. Environment Variables Validation
+  if [ -f "$SCRIPT_DIR/.env" ]; then
+    local env_ok=true
+    for var in DB_USER DB_PASSWORD DB_NAME DB_HOST JWT_SECRET SESSION_SECRET; do
+      local val; val=$(grep "^${var}=" "$SCRIPT_DIR/.env" | cut -d'=' -f2- | xargs || echo "")
+      if [ -z "$val" ]; then
+        env_ok=false
+      fi
+    done
+    if [ "$env_ok" = "true" ]; then
+      echo -e "  [✔] Environment Variables: ${GREEN}Valid and Populated${NC}"
+    else
+      echo -e "  [❌] Environment Variables: ${RED}Missing required keys${NC}"
+      all_passed=false
+    fi
+  else
+    echo -e "  [❌] Environment .env File: ${RED}Missing${NC}"
+    all_passed=false
+  fi
+  
+  # 3. Database Connectivity Check
+  if [ -f "$SCRIPT_DIR/.env" ]; then
+    local db_u; db_u=$(grep "^DB_USER=" "$SCRIPT_DIR/.env" | cut -d'=' -f2- | xargs || echo "")
+    local db_p; db_p=$(grep "^DB_PASSWORD=" "$SCRIPT_DIR/.env" | cut -d'=' -f2- | xargs || echo "")
+    local db_n; db_n=$(grep "^DB_NAME=" "$SCRIPT_DIR/.env" | cut -d'=' -f2- | xargs || echo "")
+    if PGPASSWORD="$db_p" psql -h 127.0.0.1 -U "$db_u" -d "$db_n" -c "SELECT 1;" &>/dev/null; then
+      echo -e "  [✔] Database Connectivity: ${GREEN}Healthy${NC}"
+    else
+      echo -e "  [❌] Database Connectivity: ${RED}Authentication/Connection Failed${NC}"
+      all_passed=false
+    fi
+  fi
+  
+  # 4. Port Binding Verifications
+  if check_port_listening 1935; then
+    echo -e "  [✔] RTMP Port 1935: ${GREEN}Listening${NC}"
+  else
+    echo -e "  [❌] RTMP Port 1935: ${RED}Not Listening (Nginx RTMP)${NC}"
+    all_passed=false
+  fi
+  
+  if check_port_listening 80; then
+    echo -e "  [✔] HTTP Port 80: ${GREEN}Listening${NC}"
+  else
+    echo -e "  [❌] HTTP Port 80: ${RED}Not Listening (Nginx)${NC}"
+    all_passed=false
+  fi
+  
+  if check_port_listening 5432; then
+    echo -e "  [✔] PostgreSQL Port 5432: ${GREEN}Listening${NC}"
+  else
+    echo -e "  [❌] PostgreSQL Port 5432: ${RED}Not Listening${NC}"
+    all_passed=false
+  fi
+  
+  # Optional HTTPS port 443 check
+  if [ -n "${DOMAIN_NAME:-}" ]; then
+    if check_port_listening 443; then
+      echo -e "  [✔] HTTPS Port 443: ${GREEN}Listening${NC}"
+      if [ -d "/etc/letsencrypt/live/$DOMAIN_NAME" ]; then
+        echo -e "  [✔] Let's Encrypt SSL Certs: ${GREEN}Valid and Installed${NC}"
+      else
+        echo -e "  [❌] Let's Encrypt SSL Certs: ${RED}Not found in /etc/letsencrypt/live/$DOMAIN_NAME${NC}"
+        all_passed=false
+      fi
+    else
+      echo -e "  [❌] HTTPS Port 443: ${RED}Not Listening${NC}"
+      all_passed=false
+    fi
+  fi
+  
+  # 5. API Health Endpoint Verification
+  if check_port_listening 3000; then
+    local api_healthy=false
+    if command -v curl &>/dev/null; then
+      local response; response=$(curl -s --max-time 3 http://127.0.0.1:3000/api/health || echo "")
+      if [[ "$response" == *"status"* && "$response" == *"ok"* ]]; then
+        api_healthy=true
+      fi
+    fi
+    if [ "$api_healthy" = "true" ]; then
+      echo -e "  [✔] API Health Endpoint (/api/health): ${GREEN}Healthy (status=ok)${NC}"
+    else
+      echo -e "  [❌] API Health Endpoint (/api/health): ${RED}Failed to return status ok${NC}"
+      all_passed=false
+    fi
+  else
+    echo -e "  [❌] StreamPulse Port 3000: ${RED}Not Listening (API daemon offline)${NC}"
+    all_passed=false
+  fi
+  
+  if [ "$all_passed" = true ]; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+# Auto-repair logic to resolve infrastructure anomalies
+auto_repair_infrastructure() {
+  echo -e "\n${YELLOW}${BOLD}[!] Health Check Failed. Attempting Automated Repair and Healing...${NC}"
+  
+  # 1. Repair directories
+  if [ ! -d "/var/www/hls" ] || [ ! -w "/var/www/hls" ]; then
+    echo -e "  - [Heal] Creating/fixing /var/www/hls..."
+    mkdir -p /var/www/hls/dash /var/www/hls/raw /var/www/hls/live
+    chown -R www-data:www-data /var/www/hls
+    chmod -R 775 /var/www/hls
+  fi
+  
+  if [ ! -d "/var/log/streampulse" ] || [ ! -w "/var/log/streampulse" ]; then
+    echo -e "  - [Heal] Creating/fixing /var/log/streampulse..."
+    mkdir -p /var/log/streampulse
+    chown -R streampulse:streampulse /var/log/streampulse
+    chmod -R 755 /var/log/streampulse
+  fi
+  
+  # 2. Healing PostgreSQL / Port 5432
+  if ! systemctl is-active --quiet postgresql 2>/dev/null || ! check_port_listening 5432; then
+    echo -e "  - [Heal] PostgreSQL or Port 5432 is down. Attempting start..."
+    systemctl restart postgresql || true
+    sleep 3
+  fi
+  
+  # 3. Healing Nginx / Ports 80, 1935
+  if ! systemctl is-active --quiet nginx 2>/dev/null || ! check_port_listening 80 || ! check_port_listening 1935; then
+    echo -e "  - [Heal] Nginx or Ports 80/1935 are down. Checking configurations..."
+    if ! nginx -t 2>/dev/null; then
+      echo -e "  - [Heal] Nginx config error detected! Repairing virtual hosts..."
+      rm -f /etc/nginx/sites-enabled/default
+      ln -sf /etc/nginx/sites-available/streampulse /etc/nginx/sites-enabled/streampulse
+    fi
+    systemctl restart nginx || true
+    sleep 3
+  fi
+  
+  # 4. Healing StreamPulse / Port 3000
+  if ! systemctl is-active --quiet streampulse 2>/dev/null || ! check_port_listening 3000; then
+    echo -e "  - [Heal] StreamPulse service or Port 3000 is down. Rebuilding and restarting..."
+    if [ ! -f "$SCRIPT_DIR/dist/server.cjs" ]; then
+      npm run build || true
+    fi
+    if [ ! -d "$SCRIPT_DIR/node_modules" ]; then
+      npm install --no-audit --no-fund || true
+    fi
+    systemctl daemon-reload || true
+    systemctl enable streampulse || true
+    systemctl restart streampulse || true
+    sleep 4
+  fi
+}
+
 # Rollback function triggered on failure (with self-healing fallback)
 cleanup_on_failure() {
   local exit_code=$?
@@ -95,6 +449,10 @@ trap cleanup_on_failure EXIT
 register_rollback() {
   ROLLBACK_ACTIONS+=("$1")
 }
+
+# ==============================================================================
+# INSTALLATION STEP ENGINE
+# ==============================================================================
 
 # 1. ROOT PRIVILEGE CHECK
 echo -e "[*] Validating root privileges..."
@@ -229,22 +587,6 @@ else
 fi
 echo ""
 
-# Helper to check if a port is listening
-check_port_listening() {
-  local port="$1"
-  if command -v ss &>/dev/null; then
-    ss -tuln | grep -q -E ":$port\s" && return 0
-  elif command -v netstat &>/dev/null; then
-    netstat -tuln | grep -q -E ":$port\s" && return 0
-  else
-    local hex_port=$(printf '%04X' "$port" 2>/dev/null || echo "")
-    if [ -n "$hex_port" ] && [ -f "/proc/net/tcp" ]; then
-      grep -q -i ":$hex_port" /proc/net/tcp 2>/dev/null && return 0
-    fi
-  fi
-  return 1
-}
-
 # Port conflict detection
 echo -e "[*] Detecting port conflicts..."
 PORTS_TO_CHECK=(80 1935 3000)
@@ -262,7 +604,6 @@ for port in "${PORTS_TO_CHECK[@]}"; do
       PROCESS_NAME=$(ps -p "$PID_USING_PORT" -o comm= 2>/dev/null)
     fi
     
-    # If the process is Nginx, node, or npm, it's expected during an upgrade/re-install
     if [[ "$PROCESS_NAME" == "nginx" || "$PROCESS_NAME" == "node" || "$PROCESS_NAME" == "npm" ]]; then
       echo -e "  - Port $port is in use by: ${YELLOW}$PROCESS_NAME${NC} (Expected on upgrade/restart)"
     else
@@ -302,7 +643,7 @@ if [ -t 0 ]; then
 else
   DOMAIN_NAME=""
 fi
-DOMAIN_NAME=$(echo "$DOMAIN_NAME" | xargs)
+DOMAIN_NAME=$(echo "${DOMAIN_NAME:-}" | xargs)
 
 CERTBOT_EMAIL=""
 if [ -n "$DOMAIN_NAME" ]; then
@@ -315,46 +656,12 @@ if [ -n "$DOMAIN_NAME" ]; then
 fi
 echo ""
 
-# Command retry wrapper helper function
-retry_command() {
-  local max_attempts="$1"
-  local delay="$2"
-  local description="$3"
-  shift 3
-  local attempt=1
-  while [ $attempt -le $max_attempts ]; do
-    echo -e "  - [Attempt $attempt/$max_attempts] $description..."
-    if eval "$@"; then
-      return 0
-    fi
-    echo -e "${YELLOW}  - Warning: $description failed. Retrying in $delay seconds...${NC}"
-    sleep "$delay"
-    attempt=$((attempt+1))
-  done
-  return 1
-}
-
-# 6. UPDATE SYSTEM PACKAGE LIST
+# 6. UPDATE SYSTEM PACKAGE LIST & VALIDATE REPOS
 echo -e "${BLUE}[1/13] Syncing system package repositories...${NC}"
-retry_command 3 5 "apt-get update" apt-get update -y
+safe_apt_update
 echo -e "${GREEN}[✔] Package lists updated.${NC}\n"
 
-# Helper for package installation
-is_package_installed() {
-  dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "ok installed"
-}
-
-install_package_with_retry() {
-  local pkg="$1"
-  if is_package_installed "$pkg"; then
-    echo -e "  - ${GREEN}$pkg${NC} is already installed."
-    return 0
-  fi
-  
-  retry_command 3 4 "Installing $pkg via apt" apt-get install -y "$pkg"
-}
-
-# 7. INSTALL UTILITIES
+# 7. INSTALL UTILITIES & DEPS AUTOMATICALLY
 echo -e "${BLUE}[2/13] Configuring baseline utilities and security components...${NC}"
 ESSENTIAL_PACKAGES=(git curl wget build-essential openssl gnupg2 ca-certificates ufw fail2ban logrotate)
 for pkg in "${ESSENTIAL_PACKAGES[@]}"; do
@@ -362,7 +669,6 @@ for pkg in "${ESSENTIAL_PACKAGES[@]}"; do
 done
 echo -e "${GREEN}[✔] Essential packages verified.${NC}\n"
 
-# Verify OpenSSL availability
 if ! command -v openssl &>/dev/null; then
   echo -e "${RED}[- ] Error: OpenSSL is missing and could not be installed!${NC}" >&2
   exit 1
@@ -381,7 +687,7 @@ fi
 
 if [ "$NODE_READY" = false ]; then
   echo -e "  - Setting up NodeSource Node.js 20.x repository..."
-  retry_command 3 5 "Setting up NodeSource GPG & repository" \
+  retry_command 3 5 "Setting up NodeSource GPG & repository" "Fix network connection or run setup manually" \
     "mkdir -p /etc/apt/keyrings && \
      rm -f /etc/apt/keyrings/nodesource.gpg && \
      curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
@@ -391,7 +697,6 @@ if [ "$NODE_READY" = false ]; then
   install_package_with_retry "nodejs"
 fi
 
-# Verify npm version
 if ! command -v npm &>/dev/null; then
   echo -e "  - npm is missing. Installing npm..."
   install_package_with_retry "npm"
@@ -400,33 +705,70 @@ else
 fi
 echo -e "${GREEN}[✔] Node.js and npm runtime environment validated.${NC}\n"
 
-# 9. INSTALL DOCKER & DOCKER COMPOSE
-echo -e "${BLUE}[4/13] Checking Docker Engine state...${NC}"
-if ! command -v docker &>/dev/null; then
-  echo -e "  - Docker not found. Adding GPG keys and Docker repository..."
-  retry_command 3 5 "Adding Docker GPG & repository" \
-    "install -m 0755 -d /etc/apt/keyrings && \
-     curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg --yes && \
-     chmod a+r /etc/apt/keyrings/docker.gpg && \
-     echo 'deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \$(. /etc/os-release && echo \"\$VERSION_CODENAME\") stable' | tee /etc/apt/sources.list.d/docker.list > /dev/null && \
-     apt-get update -y"
+# 9. INSTALL DOCKER & DOCKER COMPOSE SAFELY
+echo -e "${BLUE}[4/13] Checking and configuring Docker Engine...${NC}"
+DOCKER_INSTALLED=false
+if command -v docker &>/dev/null && docker --version &>/dev/null && docker info &>/dev/null; then
+  DOCKER_INSTALLED=true
+fi
+
+if [ "$DOCKER_INSTALLED" = "true" ]; then
+  echo -e "  - ${GREEN}Docker${NC} is already installed and responsive ($(docker --version))."
+else
+  echo -e "  - Installing Docker Engine..."
   
+  # Ensure any corrupted docker.list is removed
+  rm -f /etc/apt/sources.list.d/docker.list
+  
+  # Import Docker GPG keys safely
+  mkdir -p /etc/apt/keyrings
+  rm -f /etc/apt/keyrings/docker.gpg
+  
+  if ! retry_command 3 5 "Downloading Docker GPG key" "Check internet access to download GPG key" "curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg --yes"; then
+    echo -e "${RED}[- ] Error: Failed to import Docker GPG key after retries.${NC}" >&2
+    exit 1
+  fi
+  chmod a+r /etc/apt/keyrings/docker.gpg
+  
+  # Generate Docker repo line safely using dpkg architecture and os-release
+  ARCH_TYPE=$(dpkg --print-architecture)
+  OS_CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
+  if [ -z "$OS_CODENAME" ]; then
+    OS_CODENAME=$(lsb_release -cs 2>/dev/null || echo "focal")
+  fi
+  
+  REPO_LINE="deb [arch=${ARCH_TYPE} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${OS_CODENAME} stable"
+  
+  # Validate repository syntax before writing
+  VALID_PATTERN="^(deb|deb-src)[[:space:]]+(\[[^]]+\][[:space:]]+)?[a-zA-Z0-9_+.-]+://[^[:space:]]+[[:space:]]+[^[:space:]]+([[:space:]]+[^[:space:]]+)*$"
+  if [[ ! "$REPO_LINE" =~ $VALID_PATTERN ]]; then
+    echo -e "${RED}[- ] Error: Generated Docker repository entry is syntactically invalid: $REPO_LINE${NC}" >&2
+    exit 1
+  fi
+  
+  # Write entry safely
+  echo "$REPO_LINE" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+  
+  # Sync package lists with validation
+  safe_apt_update
+  
+  # Install Docker Community Edition packages
   install_package_with_retry "docker-ce"
   install_package_with_retry "docker-ce-cli"
   install_package_with_retry "containerd.io"
   install_package_with_retry "docker-buildx-plugin"
   install_package_with_retry "docker-compose-plugin"
-else
-  echo -e "  - ${GREEN}Docker${NC} is already installed ($(docker --version)). Skipping."
-fi
-
-# Verify Docker Daemon
-systemctl start docker || true
-systemctl enable docker || true
-if docker info &>/dev/null; then
-  echo -e "  - ${GREEN}Docker Daemon${NC} is responsive and running."
-else
-  echo -e "${YELLOW}[!] Warning: Docker daemon is unresponsive. Containers may fail to run.${NC}"
+  
+  # Verify Docker daemon functionality
+  systemctl start docker || true
+  systemctl enable docker || true
+  
+  if command -v docker &>/dev/null && docker info &>/dev/null; then
+    echo -e "${GREEN}[✔] Docker Engine successfully installed and verified.${NC}"
+  else
+    echo -e "${YELLOW}[!] Warning: Docker daemon is unresponsive. Re-attempting Docker restart...${NC}"
+    systemctl restart docker || true
+  fi
 fi
 
 # Verify Docker Compose Plugin
@@ -587,16 +929,18 @@ done
 
 if [ "$DB_CONN_SUCCESS" = "false" ]; then
   echo -e "  - Adjusting PostgreSQL pg_hba.conf to allow local connections..."
-  PG_VERSION=$(sudo -u postgres psql -tAc "SHOW server_version;" | cut -d'.' -f1-2 | xargs)
-  HBA_CONF="/etc/postgresql/${PG_VERSION}/main/pg_hba.conf"
-  if [ -f "$HBA_CONF" ]; then
-    cp "$HBA_CONF" "$HBA_CONF.bak.$(date +%Y%m%d%H%M%S)"
-    echo "host    all             all             127.0.0.1/32            md5" >> "$HBA_CONF"
-    systemctl restart postgresql
-    
-    # Re-verify
-    if PGPASSWORD="$DB_RAND_PASS" psql -h 127.0.0.1 -U "$DB_RAND_USER" -d "$DB_RAND_NAME" -c "SELECT 1;" &>/dev/null; then
-      DB_CONN_SUCCESS=true
+  PG_VERSION=$(sudo -u postgres psql -tAc "SHOW server_version;" | cut -d'.' -f1-2 | xargs || echo "")
+  if [ -n "$PG_VERSION" ]; then
+    HBA_CONF="/etc/postgresql/${PG_VERSION}/main/pg_hba.conf"
+    if [ -f "$HBA_CONF" ]; then
+      cp "$HBA_CONF" "$HBA_CONF.bak.$(date +%Y%m%d%H%M%S)"
+      echo "host    all             all             127.0.0.1/32            md5" >> "$HBA_CONF"
+      systemctl restart postgresql
+      
+      # Re-verify
+      if PGPASSWORD="$DB_RAND_PASS" psql -h 127.0.0.1 -U "$DB_RAND_USER" -d "$DB_RAND_NAME" -c "SELECT 1;" &>/dev/null; then
+        DB_CONN_SUCCESS=true
+      fi
     fi
   fi
 fi
@@ -612,13 +956,13 @@ fi
 echo -e "${BLUE}[8/13] Compiling and bundling full-stack application...${NC}"
 if [ ! -d "$SCRIPT_DIR/node_modules" ]; then
   echo -e "  - Node modules missing. Running npm production dependencies installation..."
-  retry_command 3 5 "npm install" npm install --no-audit --no-fund
+  retry_command 3 5 "npm install" "Check local package.json and network access" "npm install --no-audit --no-fund"
 else
   echo -e "  - Node modules already present."
 fi
 
-if [ ! -f "$SCRIPT_DIR/dist/server.cjs" ]; then
-  echo -e "  - Build target 'dist/server.cjs' is missing. Initiating automatic project build..."
+if [ ! -f "$SCRIPT_DIR/dist/server.cjs" ] || [ "${UPGRADE_MODE}" = "true" ]; then
+  echo -e "  - Building server modules..."
   if ! npm run build; then
     echo -e "${RED}[- ] Error: Application build or compilation failed!${NC}" >&2
     exit 1
@@ -650,7 +994,7 @@ chmod +x /usr/local/bin/transcode.sh
 # Directory structure setup for HLS & DASH
 echo -e "  - Generating live playlist directory tree..."
 mkdir -p /var/www/hls
-mkdir -p /var/www/hls/dash
+mkdir -p /var/www/hls/dash /var/www/hls/raw /var/www/hls/live
 chown -R www-data:www-data /var/www/hls
 chmod -R 775 /var/www/hls
 
@@ -881,204 +1225,14 @@ chown -R streampulse:streampulse /var/log/streampulse
 
 NODE_BIN_PATH=$(command -v node || which node || echo "/usr/bin/node")
 
-# Generate the systemd service automatically if missing
-if [ ! -f "/etc/systemd/system/streampulse.service" ]; then
-  echo -e "  - Generating missing systemd service file..."
-  cat << EOF > /etc/systemd/system/streampulse.service
-[Unit]
-Description=StreamPulse RTMP VPS Manager Service
-After=network.target postgresql.service nginx.service
-
-[Service]
-Type=simple
-User=streampulse
-Group=streampulse
-WorkingDirectory=$SCRIPT_DIR
-ExecStart=$NODE_BIN_PATH dist/server.cjs
-Restart=always
-RestartSec=5
-Environment=NODE_ENV=production
-Environment=PORT=3000
-
-# Resource limits and Systemd security options
-LimitNOFILE=65535
-PrivateTmp=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-fi
+# Generate the systemd service automatically
+generate_streampulse_service
 
 # Load and start StreamPulse app service
 systemctl daemon-reload
 systemctl enable streampulse
 systemctl restart streampulse
 echo -e "${GREEN}[✔] Systemd service streampulse configured and started.${NC}\n"
-
-# Helper for robust system checks
-perform_health_check() {
-  local all_passed=true
-  
-  echo -e "\n${BOLD}--- Executing StreamPulse Infrastructure Verification ---${NC}"
-  
-  # 1. PostgreSQL Service and Port
-  if systemctl is-active --quiet postgresql 2>/dev/null; then
-    echo -e "  [✔] PostgreSQL Service: ${GREEN}Active${NC}"
-  else
-    echo -e "  [❌] PostgreSQL Service: ${RED}Stopped/Not Installed${NC}"
-    all_passed=false
-  fi
-  if check_port_listening 5432; then
-    echo -e "  [✔] PostgreSQL Port 5432: ${GREEN}Listening${NC}"
-  else
-    echo -e "  [❌] PostgreSQL Port 5432: ${RED}Not Listening${NC}"
-    all_passed=false
-  fi
-  
-  # 2. Nginx Service and Ports
-  if systemctl is-active --quiet nginx 2>/dev/null; then
-    echo -e "  [✔] Nginx Service: ${GREEN}Active${NC}"
-  else
-    echo -e "  [❌] Nginx Service: ${RED}Stopped/Not Installed${NC}"
-    all_passed=false
-  fi
-  if check_port_listening 80; then
-    echo -e "  [✔] HTTP Port 80: ${GREEN}Listening${NC}"
-  else
-    echo -e "  [❌] HTTP Port 80: ${RED}Not Listening${NC}"
-    all_passed=false
-  fi
-  if check_port_listening 1935; then
-    echo -e "  [✔] RTMP Port 1935: ${GREEN}Listening${NC}"
-  else
-    echo -e "  [❌] RTMP Port 1935: ${RED}Not Listening${NC}"
-    all_passed=false
-  fi
-  
-  # 3. StreamPulse Service and Port
-  if systemctl is-active --quiet streampulse 2>/dev/null; then
-    echo -e "  [✔] StreamPulse Service: ${GREEN}Active${NC}"
-  else
-    echo -e "  [❌] StreamPulse Service: ${RED}Stopped/Not Installed${NC}"
-    all_passed=false
-  fi
-  if check_port_listening 3000; then
-    echo -e "  [✔] StreamPulse Port 3000: ${GREEN}Listening${NC}"
-  else
-    echo -e "  [❌] StreamPulse Port 3000: ${RED}Not Listening${NC}"
-    all_passed=false
-  fi
-  
-  # 4. Docker & Fail2ban Service
-  if systemctl is-active --quiet docker 2>/dev/null; then
-    echo -e "  [✔] Docker Service: ${GREEN}Active${NC}"
-  else
-    echo -e "  [❌] Docker Service: ${RED}Stopped/Not Installed${NC}"
-    all_passed=false
-  fi
-  if systemctl is-active --quiet fail2ban 2>/dev/null; then
-    echo -e "  [✔] Fail2ban Service: ${GREEN}Active${NC}"
-  else
-    echo -e "  [❌] Fail2ban Service: ${RED}Stopped/Not Installed${NC}"
-    all_passed=false
-  fi
-  
-  if [ "$all_passed" = true ]; then
-    return 0
-  else
-    return 1
-  fi
-}
-
-# Auto-repair logic to resolve infrastructure anomalies
-auto_repair_infrastructure() {
-  echo -e "\n${YELLOW}${BOLD}[!] Health Check Failed. Attempting Automated Repair and Healing...${NC}"
-  
-  # 1. Healing PostgreSQL / Port 5432
-  if ! systemctl is-active --quiet postgresql 2>/dev/null || ! check_port_listening 5432; then
-    echo -e "  - [Heal] PostgreSQL or Port 5432 is down. Attempting start..."
-    systemctl restart postgresql &>>"$INSTALL_LOG" || true
-    sleep 3
-    if ! check_port_listening 5432; then
-      echo -e "  - [Heal] PostgreSQL port still not open. Reconfiguring pg_hba.conf..."
-      local pg_version=$(sudo -u postgres psql -tAc "SHOW server_version;" 2>/dev/null | cut -d'.' -f1-2 | xargs || echo "")
-      if [ -n "$pg_version" ] && [ -f "/etc/postgresql/${pg_version}/main/pg_hba.conf" ]; then
-        if ! grep -q "127.0.0.1/32" "/etc/postgresql/${pg_version}/main/pg_hba.conf"; then
-          echo "host    all             all             127.0.0.1/32            md5" >> "/etc/postgresql/${pg_version}/main/pg_hba.conf"
-        fi
-      fi
-      systemctl restart postgresql &>>"$INSTALL_LOG" || true
-      sleep 3
-    fi
-  fi
-  
-  # 2. Healing Nginx / Ports 80, 1935
-  if ! systemctl is-active --quiet nginx 2>/dev/null || ! check_port_listening 80 || ! check_port_listening 1935; then
-    echo -e "  - [Heal] Nginx or Ports 80/1935 are down. Checking Nginx configurations..."
-    if ! nginx -t &>>"$INSTALL_LOG"; then
-      echo -e "  - [Heal] Nginx config error detected! Resetting default sites..."
-      rm -f /etc/nginx/sites-enabled/default
-      ln -sf /etc/nginx/sites-available/streampulse /etc/nginx/sites-enabled/streampulse
-    fi
-    systemctl restart nginx &>>"$INSTALL_LOG" || true
-    sleep 3
-  fi
-  
-  # 3. Healing StreamPulse / Port 3000
-  if ! systemctl is-active --quiet streampulse 2>/dev/null || ! check_port_listening 3000; then
-    echo -e "  - [Heal] StreamPulse service or Port 3000 is down. Initiating codebase healing..."
-    
-    if [ ! -f "$SCRIPT_DIR/dist/server.cjs" ]; then
-      echo -e "  - [Heal] Build output 'dist/server.cjs' is missing! Rebuilding applet..."
-      npm run build &>>"$INSTALL_LOG" || true
-    fi
-    
-    if [ ! -d "$SCRIPT_DIR/node_modules" ]; then
-      echo -e "  - [Heal] 'node_modules' is missing! Running npm install..."
-      npm install --no-audit --no-fund &>>"$INSTALL_LOG" || true
-    fi
-    
-    echo -e "  - [Heal] Restarting systemd service 'streampulse'..."
-    systemctl daemon-reload &>>"$INSTALL_LOG" || true
-    systemctl enable streampulse &>>"$INSTALL_LOG" || true
-    systemctl restart streampulse &>>"$INSTALL_LOG" || true
-    sleep 5
-    
-    if ! check_port_listening 3000; then
-      echo -e "${YELLOW}  - [Heal] StreamPulse service failed to bind to port 3000. System logs:${NC}"
-      journalctl -u streampulse -n 15 --no-pager || true
-    fi
-  fi
-  
-  # 4. Healing Docker & Fail2ban
-  if ! systemctl is-active --quiet docker 2>/dev/null; then
-    echo -e "  - [Heal] Docker is inactive. Restarting Docker..."
-    systemctl restart docker &>>"$INSTALL_LOG" || true
-  fi
-  if ! systemctl is-active --quiet fail2ban 2>/dev/null; then
-    echo -e "  - [Heal] Fail2ban is inactive. Restarting Fail2ban..."
-    systemctl restart fail2ban &>>"$INSTALL_LOG" || true
-  fi
-}
-
-print_installation_success() {
-  echo -e "${GREEN}${BOLD}==============================================================================${NC}"
-  echo -e "${GREEN}${BOLD}   🏁  StreamPulse installed successfully                                    ${NC}"
-  echo -e "${GREEN}${BOLD}==============================================================================${NC}"
-  echo -e "\nYour video streaming platform is fully online, secured, and ready for production."
-  echo -e "You can access the admin dashboard by visiting: ${CYAN}http://${DOMAIN_NAME:-<YOUR_VPS_IP>}${NC}"
-  echo -e "RTMP stream ingests can be pushed to:         ${CYAN}rtmp://${DOMAIN_NAME:-<YOUR_VPS_IP>}/live${NC}"
-  echo -e "\n${BOLD}Database Credentials:${NC}"
-  echo -e "  - Host:      ${CYAN}127.0.0.1${NC}"
-  echo -e "  - User:      ${CYAN}${DB_RAND_USER}${NC}"
-  echo -e "  - Password:  ${CYAN}[SECURED IN .env]${NC}"
-  echo -e "  - Database:  ${CYAN}${DB_RAND_NAME}${NC}"
-  echo -e "\n${BOLD}Default Admin Credentials:${NC}"
-  echo -e "  - Username:  ${CYAN}admin${NC}"
-  echo -e "  - Password:  ${CYAN}admin123${NC}"
-  echo -e "\n${YELLOW}To view live application logs, execute: journalctl -u streampulse -f${NC}"
-  echo -e "==============================================================================\n"
-}
 
 # 19. FINAL HEALTH CHECKS AND DIAGNOSTIC SUITE RUNNER
 echo -e "${BLUE}[*] Launching comprehensive platform diagnostic test validation...${NC}"
