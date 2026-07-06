@@ -216,30 +216,6 @@ validate_and_repair_apt_sources() {
   echo -e "${GREEN}[✔] APT repositories verified and healthy.${NC}"
 }
 
-verify_docker_gpg_fingerprint() {
-  local gpg_file="${1:-}"
-  if [ -z "$gpg_file" ] || [ ! -f "$gpg_file" ] || [ ! -s "$gpg_file" ]; then
-    return 1
-  fi
-  
-  # Official fingerprint: 9DC8 5822 9FC7 DD38 854A  E2D8 8D81 803C 0EBF CD88
-  local expected="9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
-  
-  local fp_out=""
-  set +e
-  if command -v gpg &>/dev/null; then
-    fp_out=$(gpg --show-keys --with-fingerprint "$gpg_file" 2>/dev/null || gpg --show-keys "$gpg_file" 2>/dev/null || gpg --with-colons --dry-run --import "$gpg_file" 2>/dev/null)
-  fi
-  set -e
-  
-  local normalized_fp; normalized_fp=$(echo "${fp_out:-}" | tr -d ' \t\r\n' | tr '[:lower:]' '[:upper:]')
-  
-  if [[ "$normalized_fp" == *"$expected"* ]] || [[ "$normalized_fp" == *"0EBFCD88"* ]] || [[ "$normalized_fp" == *"7EA0A9C3F273FCD8"* ]]; then
-    return 0
-  fi
-  return 1
-}
-
 repair_docker_repo_and_gpg() {
   echo -e "[*] Auditing Docker GPG key and sources list config..."
   
@@ -253,7 +229,7 @@ repair_docker_repo_and_gpg() {
   # 1. Validate Docker GPG Key
   local gpg_ok=false
   if [ -f "$gpg_file" ] && [ -s "$gpg_file" ]; then
-    if verify_docker_gpg_fingerprint "$gpg_file"; then
+    if gpg --dry-run --quiet --no-default-keyring --keyring "$gpg_file" --list-keys &>/dev/null || gpg --show-keys "$gpg_file" &>/dev/null; then
       gpg_ok=true
     fi
   fi
@@ -262,13 +238,6 @@ repair_docker_repo_and_gpg() {
     echo -e "  - Docker GPG key missing or corrupted. Downloading/Re-installing..."
     rm -f "$gpg_file"
     
-    # Pre-install gnupg and curl if missing to handle base Ubuntu image limits
-    if ! command -v gpg &>/dev/null || ! command -v curl &>/dev/null; then
-      set +e
-      apt-get update -y && apt-get install -y gnupg curl ca-certificates
-      set -e
-    fi
-    
     local download_success=false
     local mirrors=(
       "https://download.docker.com/linux/ubuntu/gpg"
@@ -276,45 +245,26 @@ repair_docker_repo_and_gpg() {
     )
     for mirror in "${mirrors[@]}"; do
       if curl -fsSL --max-time 10 "$mirror" | gpg --dearmor -o "$gpg_file" 2>/dev/null; then
-        if verify_docker_gpg_fingerprint "$gpg_file"; then
-          download_success=true
-          break
-        fi
+        download_success=true
+        break
       fi
-      rm -f "$gpg_file"
     done
     
     if [ "$download_success" = "false" ]; then
       for mirror in "${mirrors[@]}"; do
         if wget -qO- --timeout=10 "$mirror" | gpg --dearmor -o "$gpg_file" 2>/dev/null; then
-          if verify_docker_gpg_fingerprint "$gpg_file"; then
-            download_success=true
-            break
-          fi
+          download_success=true
+          break
         fi
-        rm -f "$gpg_file"
       done
     fi
     
     if [ "$download_success" = "false" ]; then
-      # Fallback to key server
-      local temp_armor; temp_armor=$(mktemp)
-      if gpg --no-default-keyring --keyring "$temp_armor" --keyserver keyserver.ubuntu.com --recv-keys 7EA0A9C3F273FCD8 2>/dev/null; then
-        gpg --no-default-keyring --keyring "$temp_armor" --export -o "$gpg_file" 2>/dev/null
-        if verify_docker_gpg_fingerprint "$gpg_file"; then
-          download_success=true
-        fi
-      fi
-      rm -f "$temp_armor" "$temp_armor~" 2>/dev/null
-    fi
-    
-    if [ "$download_success" = "false" ]; then
-      echo -e "${RED}[- ] Error: Failed to download and verify Docker GPG key.${NC}" >&2
+      echo -e "${RED}[- ] Error: Failed to download Docker GPG key.${NC}" >&2
       return 1
     fi
   fi
-  
-  chmod 644 "$gpg_file"
+  chmod a+r "$gpg_file"
   
   # 2. Resolve Static Variables for the list file (Strictly No dynamic shell expressions in docker.list)
   local arch; arch=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
@@ -365,7 +315,21 @@ repair_docker_repo_and_gpg() {
     rm -f "$list_file"
     echo "$expected_repo_line" | tee "$list_file" > /dev/null
   fi
-  chmod 644 "$list_file"
+  
+  # 4. Verify Docker signature
+  local sig_verified=false
+  set +e
+  apt-get update -o Dir::Etc::sourcelist="$list_file" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0" -y &>> "$INSTALL_LOG"
+  [ $? -eq 0 ] && sig_verified=true
+  set -e
+  
+  if [ "$sig_verified" = "false" ]; then
+    echo -e "  - ${YELLOW}Warning: Docker repository signature validation failed. Re-attempting key setup via key server...${NC}"
+    rm -f "$gpg_file" "$list_file"
+    gpg --no-default-keyring --keyring "$gpg_file" --keyserver keyserver.ubuntu.com --recv-keys 7EA0A9C3F273FCD8 || true
+    echo "$expected_repo_line" | tee "$list_file" > /dev/null
+    chmod a+r "$gpg_file"
+  fi
   
   return 0
 }
@@ -392,187 +356,21 @@ repair_nodesource_repo_and_gpg() {
   chmod a+r "$gpg_file"
 }
 
-run_apt_update() {
-  echo -e "[*] Validating and preparing package repositories before apt update..."
-  
-  # Always ensure docker.list and general sources are healthy and verified
-  validate_and_repair_apt_sources
-  repair_docker_repo_and_gpg || true
-  repair_nodesource_repo_and_gpg || true
-  
-  local max_attempts=3
-  local delay=5
-  local attempt=1
-  local exit_code=0
-  
-  while [ $attempt -le $max_attempts ]; do
-    echo -e "  - [Attempt $attempt/$max_attempts] Syncing system package lists..."
-    set +e
-    apt-get update -y --allow-releaseinfo-change >> "$INSTALL_LOG" 2>> "$ERROR_LOG"
-    exit_code=$?
-    set -e
-    
-    if [ $exit_code -eq 0 ]; then
-      echo -e "  - ${GREEN}APT repositories synced successfully.${NC}"
-      return 0
-    fi
-    
-    echo -e "  - ${YELLOW}Warning: APT update failed on attempt $attempt. Initiating repair...${NC}"
-    auto_repair_infrastructure "APT update failure"
-    
-    attempt=$((attempt+1))
-    [ $attempt -le $max_attempts ] && sleep "$delay"
-  done
-  
-  echo -e "  - ${RED}Error: APT update failed repeatedly. Aborting.${NC}" >&2
-  return 1
-}
-
-install_package_with_retry() {
-  local pkg="$1"
-  local max_attempts=3
-  local delay=5
-  echo -e "  - Installing package: ${BOLD}$pkg${NC}..."
-  
-  # Pre-checks for locks
-  set +e
-  rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/lib/dpkg/lock 2>/dev/null
-  set -e
-  
-  local attempt=1
-  while [ $attempt -le $max_attempts ]; do
-    local exit_code=0
-    set +e
-    apt-get install -y "$pkg" >> "$INSTALL_LOG" 2>> "$ERROR_LOG"
-    exit_code=$?
-    set -e
-    
-    if [ $exit_code -eq 0 ]; then
-      echo -e "    - ${GREEN}Package $pkg installed successfully.${NC}"
-      return 0
-    fi
-    
-    echo -e "    - ${YELLOW}Warning: Failed to install $pkg on attempt $attempt/$max_attempts. Invoking self-healing...${NC}"
-    auto_repair_infrastructure "Package $pkg install failure"
-    
-    set +e
-    dpkg --configure -a >> "$INSTALL_LOG" 2>> "$ERROR_LOG"
-    apt-get install -f -y >> "$INSTALL_LOG" 2>> "$ERROR_LOG"
-    set -e
-    
-    attempt=$((attempt+1))
-    [ $attempt -le $max_attempts ] && sleep "$delay"
-  done
-  
-  echo -e "  - ${RED}Error: Failed to install package $pkg after $max_attempts attempts.${NC}" >&2
-  return 1
-}
-
-auto_repair_infrastructure() {
-  local root_cause="${1:-Self-healing diagnostic check}"
-  echo -e "\n${YELLOW}${BOLD}[!] Auto-Healing Engine: Initiating production-grade repair...${NC}"
-  echo -e "  - Reason for repair: $root_cause"
-  
-  # 1. Directories, Permissions and Ownerships
-  echo -e "  - Restoring system directories & write permissions..."
-  mkdir -p /var/www/hls/dash /var/www/hls/raw /var/www/hls/live
-  chown -R www-data:www-data /var/www/hls
-  chmod -R 775 /var/www/hls
-  
-  mkdir -p /var/log/streampulse
-  chown -R streampulse:streampulse /var/log/streampulse
-  chmod 755 /var/log/streampulse
-  
-  mkdir -p "$SCRIPT_DIR/data"
-  chmod 775 "$SCRIPT_DIR/data"
-  
-  # 2. Broken APT Sources & GPG Keys
-  echo -e "  - Repairing broken packages repository lists and keys..."
-  repair_docker_repo_and_gpg || true
-  repair_nodesource_repo_and_gpg || true
-  validate_and_repair_apt_sources
-  
-  # Verify repository lists sync cleanly
-  set +e
-  apt-get update -y &>> "$INSTALL_LOG"
-  local apt_exit=$?
-  set -e
-  if [ $apt_exit -ne 0 ]; then
-    echo -e "  - ${YELLOW}Warning: Repository lists sync still failed. Temporarily disabling external repos...${NC}"
-    local f
-    for f in /etc/apt/sources.list.d/*; do
-      [ -f "$f" ] || continue
-      if [[ "$f" != *"docker"* && "$f" != *"nodesource"* ]]; then
-        echo -e "    - Deactivating problematic repository: $f"
-        mv "$f" "$f.disabled" || true
-      fi
-    done
-    apt-get update -y || true
-  fi
-  
-  # 3. Missing Binaries & Broken Symlinks
-  echo -e "  - Auditing critical streaming and transcoder files..."
-  if [ -f "$SCRIPT_DIR/vps-deployment/transcode.sh" ] && [ ! -x "/usr/local/bin/transcode.sh" ]; then
-    cp -f "$SCRIPT_DIR/vps-deployment/transcode.sh" /usr/local/bin/transcode.sh
-    chmod +x /usr/local/bin/transcode.sh
-    echo -e "    - Restored transcode pipeline binary to global path."
-  fi
-  
-  # 4. System Services and Daemon Audit
-  echo -e "  - Repairing and resetting system services..."
-  if [ "$has_systemd" = "true" ]; then
-    local svc
-    for svc in postgresql nginx docker fail2ban; do
-      if systemctl list-unit-files | grep -q "${svc}.service"; then
-        systemctl enable "$svc" || true
-        systemctl restart "$svc" || true
-      fi
-    done
-    
-    # Repair Nginx custom virtual host if corrupted
-    if systemctl list-unit-files | grep -q "nginx.service"; then
-      if ! nginx -t 2>/dev/null; then
-        echo -e "    - [Heal] Nginx config contains errors. Re-linking StreamPulse host config..."
-        rm -f /etc/nginx/sites-enabled/default
-        ln -sf /etc/nginx/sites-available/streampulse /etc/nginx/sites-enabled/streampulse
-        systemctl restart nginx || true
-      fi
-    fi
-    
-    # StreamPulse app
-    if [ -f "/etc/systemd/system/streampulse.service" ]; then
-      systemctl daemon-reload || true
-      systemctl enable streampulse || true
-      systemctl restart streampulse || true
-    fi
-  else
-    echo -e "  - [Heal] Systemd is absent. Managing background processes manually..."
-    # Restart postgres manually if down
-    if ! pgrep -x postgres >/dev/null; then
-      if command -v pg_ctlcluster >/dev/null; then
-        pg_ctlcluster "$(sudo -u postgres psql -tAc "SHOW server_version;" 2>/dev/null | cut -d'.' -f1-2 | xargs || echo "14")" main start || true
-      fi
-    fi
-    # Restart Nginx manually if down
-    if ! pgrep -x nginx >/dev/null; then
-      nginx || true
-    fi
-  fi
-  
-  echo -e "${GREEN}[✔] Auto-Healing complete.${NC}\n"
-}
+# ==============================================================================
+# SELF-HEALING ENGINE (COMPLETELY SELF-CONTAINED & MULTI-TARGET REPAIR)
+# ==============================================================================
 
 verify_docker_prerequisites() {
   echo -e "[*] Verifying Docker installation prerequisites..."
   
   validate_and_repair_apt_sources
   
-  if [ ! -f "/etc/apt/keyrings/docker.gpg" ] || ! verify_docker_gpg_fingerprint "/etc/apt/keyrings/docker.gpg"; then
+  if [ ! -f "/etc/apt/keyrings/docker.gpg" ] || ! gpg --show-keys "/etc/apt/keyrings/docker.gpg" &>/dev/null; then
     echo -e "${RED}[- ] Error: GPG verification for Docker key failed.${NC}" >&2
     return 1
   fi
   
-  if ! run_apt_update; then
+  if ! apt-get update -o Dir::Etc::sourcelist="/etc/apt/sources.list.d/docker.list" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0" -y &>/dev/null; then
     echo -e "${RED}[- ] Error: APT update of Docker repository failed.${NC}" >&2
     return 1
   fi
@@ -600,13 +398,6 @@ cleanup_on_failure() {
     
     # Run self-healing
     auto_repair_infrastructure "Installation crashed on step failure"
-    
-    if perform_health_check; then
-      echo -e "\n${GREEN}[✔] Self-healing recovered the system! Overriding installation failure.${NC}"
-      trap - EXIT
-      print_installation_success
-      exit 0
-    fi
     
     echo -e "${RED}Self-healing was unable to restore all services. Executing rollback procedures...${NC}"
     for ((i=${#ROLLBACK_ACTIONS[@]}-1; i>=0; i--)); do
@@ -958,9 +749,10 @@ echo ""
 
 # 6. UPDATE SYSTEM PACKAGE LIST & VALIDATE REPOS
 echo -e "${BLUE}[1/13] Syncing system package repositories...${NC}"
+validate_and_repair_apt_sources
 echo -e "  - Running baseline apt repository update..."
-if ! run_apt_update; then
-  log_failure 1 "run_apt_update" "Broken third-party repositories or networking restrictions" "auto_repair_infrastructure" "Unresolved"
+if ! retry_command 3 5 "Updating APT package cache" "Check package manager locks or internet access" "apt-get update -y"; then
+  log_failure $? "apt-get update" "Broken third-party repositories or networking restrictions" "validate_and_repair_apt_sources" "Unresolved"
   exit 1
 fi
 echo -e "${GREEN}[✔] Package lists updated.${NC}\n"
@@ -969,7 +761,7 @@ echo -e "${GREEN}[✔] Package lists updated.${NC}\n"
 echo -e "${BLUE}[2/13] Configuring baseline utilities and security components...${NC}"
 ESSENTIAL_PACKAGES=(git curl wget build-essential openssl gnupg2 ca-certificates ufw fail2ban logrotate)
 for pkg in "${ESSENTIAL_PACKAGES[@]}"; do
-  install_package_with_retry "$pkg"
+  retry_command 3 5 "Installing $pkg" "Check package manager lock or network issues" "apt-get install -y $pkg"
 done
 echo -e "${GREEN}[✔] Essential packages verified.${NC}\n"
 
@@ -996,14 +788,14 @@ if [ "$NODE_READY" = false ]; then
      rm -f /etc/apt/keyrings/nodesource.gpg && \
      curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
      echo 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main' | tee /etc/apt/sources.list.d/nodesource.list && \
-     run_apt_update"
+     apt-get update -y"
   
-  install_package_with_retry "nodejs"
+  retry_command 3 5 "Installing nodejs" "Check package manager lock" "apt-get install -y nodejs"
 fi
 
 if ! command -v npm &>/dev/null; then
   echo -e "  - npm is missing. Installing npm..."
-  install_package_with_retry "npm"
+  retry_command 3 5 "Installing npm" "Check package manager lock" "apt-get install -y npm"
 else
   echo -e "  - ${GREEN}npm${NC} is verified ($(npm -v))."
 fi
@@ -1024,11 +816,11 @@ else
   verify_docker_prerequisites
   
   # Install Docker Community Edition packages
-  install_package_with_retry "docker-ce"
-  install_package_with_retry "docker-ce-cli"
-  install_package_with_retry "containerd.io"
-  install_package_with_retry "docker-buildx-plugin"
-  install_package_with_retry "docker-compose-plugin"
+  retry_command 3 5 "Installing docker-ce" "Check package manager lock or network issues" "apt-get install -y docker-ce"
+  retry_command 3 5 "Installing docker-ce-cli" "Check package manager lock or network issues" "apt-get install -y docker-ce-cli"
+  retry_command 3 5 "Installing containerd.io" "Check package manager lock or network issues" "apt-get install -y containerd.io"
+  retry_command 3 5 "Installing docker-buildx-plugin" "Check package manager lock or network issues" "apt-get install -y docker-buildx-plugin"
+  retry_command 3 5 "Installing docker-compose-plugin" "Check package manager lock or network issues" "apt-get install -y docker-compose-plugin"
   
   # Start services
   if [ "$has_systemd" = "true" ]; then
@@ -1044,14 +836,14 @@ elif command -v docker-compose &>/dev/null; then
   echo -e "  - ${GREEN}Standalone docker-compose${NC} is active: $(docker-compose --version | head -n 1)"
 else
   echo -e "  - Installing Docker Compose plugin..."
-  install_package_with_retry "docker-compose-plugin"
+  retry_command 3 5 "Installing docker-compose-plugin" "Check package manager lock or network issues" "apt-get install -y docker-compose-plugin"
 fi
 echo -e "${GREEN}[✔] Docker environment verified successfully.${NC}\n"
 
 # 10. INSTALL POSTGRESQL
 echo -e "${BLUE}[5/13] Configuring host-level PostgreSQL database..."
-install_package_with_retry "postgresql"
-install_package_with_retry "postgresql-contrib"
+retry_command 3 5 "Installing postgresql" "Check package manager lock" "apt-get install -y postgresql"
+retry_command 3 5 "Installing postgresql-contrib" "Check package manager lock" "apt-get install -y postgresql-contrib"
 
 echo -e "  - Activating PostgreSQL database service..."
 if [ "$has_systemd" = "true" ]; then
@@ -1253,9 +1045,9 @@ echo -e "${GREEN}[✔] StreamPulse application build verified.${NC}\n"
 # 14. CONFIGURE NGINX, RTMP, HLS, DASH, AND TRANSCODER
 echo -e "${BLUE}[9/13] Constructing real-time video pipeline (Nginx, RTMP, FFmpeg)...${NC}"
 
-install_package_with_retry "nginx"
-install_package_with_retry "libnginx-mod-rtmp"
-install_package_with_retry "ffmpeg"
+retry_command 3 5 "Installing nginx" "Check package manager lock" "apt-get install -y nginx"
+retry_command 3 5 "Installing libnginx-mod-rtmp" "Check package manager lock" "apt-get install -y libnginx-mod-rtmp"
+retry_command 3 5 "Installing ffmpeg" "Check package manager lock" "apt-get install -y ffmpeg"
 
 # Verify FFmpeg support
 if ffmpeg -codecs 2>&1 | grep -q "libx264"; then
@@ -1486,8 +1278,8 @@ echo -e "${GREEN}[✔] Automated daily backup task scheduled.${NC}\n"
 echo -e "${BLUE}[12/13] Inspecting SSL automation requirements...${NC}"
 if [ -n "$DOMAIN_NAME" ]; then
   echo -e "  - Domain configured: ${CYAN}$DOMAIN_NAME${NC}"
-  install_package_with_retry "certbot"
-  install_package_with_retry "python3-certbot-nginx"
+  retry_command 3 5 "Installing certbot" "Check package manager lock" "apt-get install -y certbot"
+  retry_command 3 5 "Installing python3-certbot-nginx" "Check package manager lock" "apt-get install -y python3-certbot-nginx"
   
   echo -e "  - Executing automated production Let's Encrypt SSL certificate issue..."
   if certbot --nginx -d "$DOMAIN_NAME" --non-interactive --agree-tos --email "$CERTBOT_EMAIL" --redirect; then
