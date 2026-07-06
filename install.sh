@@ -106,6 +106,12 @@ retry_command() {
   local attempt=1
   while [ $attempt -le $max_attempts ]; do
     echo -e "  - [Attempt $attempt/$max_attempts] $description..."
+    
+    # Lock-busting for apt/dpkg commands
+    if [[ "$cmd" == *"apt-get"* || "$cmd" == *"apt"* || "$cmd" == *"dpkg"* ]]; then
+      rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/lib/dpkg/lock 2>/dev/null
+    fi
+    
     local exit_code=0
     set +e
     eval "$cmd" >> "$INSTALL_LOG" 2>> "$ERROR_LOG"
@@ -114,6 +120,16 @@ retry_command() {
     if [ $exit_code -eq 0 ]; then
       return 0
     fi
+    
+    # Self-healing on apt/dpkg failures
+    if [[ "$cmd" == *"apt-get"* || "$cmd" == *"apt"* || "$cmd" == *"dpkg"* ]]; then
+      echo -e "${YELLOW}  - [Heal] Running dpkg repair on failure...${NC}"
+      set +e
+      dpkg --configure -a >> "$INSTALL_LOG" 2>> "$ERROR_LOG"
+      apt-get install -f -y >> "$INSTALL_LOG" 2>> "$ERROR_LOG"
+      set -e
+    fi
+    
     echo -e "${YELLOW}  - Warning: $description failed. Retrying in $delay seconds...${NC}"
     sleep "$delay"
     attempt=$((attempt+1))
@@ -229,7 +245,7 @@ repair_docker_repo_and_gpg() {
   # 1. Validate Docker GPG Key
   local gpg_ok=false
   if [ -f "$gpg_file" ] && [ -s "$gpg_file" ]; then
-    if gpg --dry-run --quiet --no-default-keyring --keyring "$gpg_file" --list-keys &>/dev/null || gpg --show-keys "$gpg_file" &>/dev/null; then
+    if gpg --show-keys "$gpg_file" &>/dev/null; then
       gpg_ok=true
     fi
   fi
@@ -257,6 +273,19 @@ repair_docker_repo_and_gpg() {
           break
         fi
       done
+    fi
+    
+    if [ "$download_success" = "false" ]; then
+      # Fallback to keyserver with clean export
+      echo -e "  - Falling back to Keyserver (port 80) for Docker GPG Key..."
+      local temp_keyring; temp_keyring=$(mktemp)
+      rm -f "$temp_keyring"
+      if gpg --no-default-keyring --keyring "$temp_keyring" --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys 7EA0A9C3F273FCD8 &>/dev/null; then
+        if gpg --no-default-keyring --keyring "$temp_keyring" --export 7EA0A9C3F273FCD8 > "$gpg_file" 2>/dev/null; then
+          download_success=true
+        fi
+      fi
+      rm -f "$temp_keyring" "$temp_keyring~" 2>/dev/null
     fi
     
     if [ "$download_success" = "false" ]; then
@@ -326,7 +355,14 @@ repair_docker_repo_and_gpg() {
   if [ "$sig_verified" = "false" ]; then
     echo -e "  - ${YELLOW}Warning: Docker repository signature validation failed. Re-attempting key setup via key server...${NC}"
     rm -f "$gpg_file" "$list_file"
-    gpg --no-default-keyring --keyring "$gpg_file" --keyserver keyserver.ubuntu.com --recv-keys 7EA0A9C3F273FCD8 || true
+    
+    local temp_keyring; temp_keyring=$(mktemp)
+    rm -f "$temp_keyring"
+    if gpg --no-default-keyring --keyring "$temp_keyring" --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys 7EA0A9C3F273FCD8 &>/dev/null; then
+      gpg --no-default-keyring --keyring "$temp_keyring" --export 7EA0A9C3F273FCD8 > "$gpg_file" 2>/dev/null
+    fi
+    rm -f "$temp_keyring" "$temp_keyring~" 2>/dev/null
+    
     echo "$expected_repo_line" | tee "$list_file" > /dev/null
     chmod a+r "$gpg_file"
   fi
@@ -354,6 +390,99 @@ repair_nodesource_repo_and_gpg() {
     curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o "$gpg_file" || true
   fi
   chmod a+r "$gpg_file"
+}
+
+auto_repair_infrastructure() {
+  local root_cause="${1:-Self-healing diagnostic check}"
+  echo -e "\n${YELLOW}${BOLD}[!] Auto-Healing Engine: Initiating production-grade repair...${NC}"
+  echo -e "  - Reason for repair: $root_cause"
+  
+  # 1. Directories, Permissions and Ownerships
+  echo -e "  - Restoring system directories & write permissions..."
+  mkdir -p /var/www/hls/dash /var/www/hls/raw /var/www/hls/live
+  chown -R www-data:www-data /var/www/hls 2>/dev/null || true
+  chmod -R 775 /var/www/hls 2>/dev/null || true
+  
+  mkdir -p /var/log/streampulse
+  chown -R streampulse:streampulse /var/log/streampulse 2>/dev/null || true
+  chmod 755 /var/log/streampulse 2>/dev/null || true
+  
+  mkdir -p "$SCRIPT_DIR/data" 2>/dev/null || true
+  chmod 775 "$SCRIPT_DIR/data" 2>/dev/null || true
+  
+  # 2. Broken APT Sources & GPG Keys
+  echo -e "  - Repairing broken packages repository lists and keys..."
+  repair_docker_repo_and_gpg || true
+  repair_nodesource_repo_and_gpg || true
+  validate_and_repair_apt_sources
+  
+  # Verify repository lists sync cleanly
+  set +e
+  apt-get update -y &>> "$INSTALL_LOG"
+  local apt_exit=$?
+  set -e
+  if [ $apt_exit -ne 0 ]; then
+    echo -e "  - ${YELLOW}Warning: Repository lists sync still failed. Temporarily disabling external repos...${NC}"
+    local f
+    for f in /etc/apt/sources.list.d/*; do
+      [ -f "$f" ] || continue
+      if [[ "$f" != *"docker"* && "$f" != *"nodesource"* ]]; then
+        echo -e "    - Deactivating problematic repository: $f"
+        mv "$f" "$f.disabled" || true
+      fi
+    done
+    apt-get update -y || true
+  fi
+  
+  # 3. Missing Binaries & Broken Symlinks
+  echo -e "  - Auditing critical streaming and transcoder files..."
+  if [ -f "$SCRIPT_DIR/vps-deployment/transcode.sh" ] && [ ! -x "/usr/local/bin/transcode.sh" ]; then
+    cp -f "$SCRIPT_DIR/vps-deployment/transcode.sh" /usr/local/bin/transcode.sh
+    chmod +x /usr/local/bin/transcode.sh
+  fi
+  
+  # 4. System Services and Daemon Audit
+  echo -e "  - Repairing and resetting system services..."
+  if [ "$has_systemd" = "true" ]; then
+    local svc
+    for svc in postgresql nginx docker fail2ban; do
+      if systemctl list-unit-files | grep -q "${svc}.service"; then
+        systemctl enable "$svc" || true
+        systemctl restart "$svc" || true
+      fi
+    done
+    
+    # Repair Nginx custom virtual host if corrupted
+    if systemctl list-unit-files | grep -q "nginx.service"; then
+      if ! nginx -t 2>/dev/null; then
+        echo -e "    - [Heal] Nginx config contains errors. Re-linking StreamPulse host config..."
+        rm -f /etc/nginx/sites-enabled/default
+        ln -sf /etc/nginx/sites-available/streampulse /etc/nginx/sites-enabled/streampulse
+        systemctl restart nginx || true
+      fi
+    fi
+    
+    # StreamPulse app
+    if [ -f "/etc/systemd/system/streampulse.service" ]; then
+      systemctl daemon-reload || true
+      systemctl enable streampulse || true
+      systemctl restart streampulse || true
+    fi
+  else
+    echo -e "  - [Heal] Systemd is absent. Managing background processes manually..."
+    # Restart postgres manually if down
+    if ! pgrep -x postgres >/dev/null; then
+      if command -v pg_ctlcluster >/dev/null; then
+        pg_ctlcluster "$(sudo -u postgres psql -tAc "SHOW server_version;" 2>/dev/null | cut -d'.' -f1-2 | xargs || echo "14")" main start || true
+      fi
+    fi
+    # Restart Nginx manually if down
+    if ! pgrep -x nginx >/dev/null; then
+      nginx || true
+    fi
+  fi
+  
+  echo -e "${GREEN}[✔] Auto-Healing complete.${NC}\n"
 }
 
 # ==============================================================================
