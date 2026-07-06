@@ -44,17 +44,159 @@ chmod 755 "$LOG_DIR"
 
 # 3. APT Source List Audit and Repair
 echo -e "${BLUE}[*] Auditing and repairing APT repository lists...${NC}"
-seen_repos_file=$(mktemp)
 
-# Clean up corrupted docker.list
-if [ -f "/etc/apt/sources.list.d/docker.list" ]; then
-  if ! grep -q "download.docker.com" /etc/apt/sources.list.d/docker.list 2>/dev/null; then
-    echo -e "  - ${YELLOW}Corrupted Docker list detected. Automatically deleting...${NC}"
-    rm -f /etc/apt/sources.list.d/docker.list
+verify_docker_gpg_fingerprint() {
+  local gpg_file="${1:-}"
+  if [ -z "$gpg_file" ] || [ ! -f "$gpg_file" ] || [ ! -s "$gpg_file" ]; then
+    return 1
   fi
-fi
+  
+  # Official fingerprint: 9DC8 5822 9FC7 DD38 854A  E2D8 8D81 803C 0EBF CD88
+  local expected="9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
+  
+  local fp_out=""
+  set +e
+  if command -v gpg &>/dev/null; then
+    fp_out=$(gpg --show-keys --with-fingerprint "$gpg_file" 2>/dev/null || gpg --show-keys "$gpg_file" 2>/dev/null || gpg --with-colons --dry-run --import "$gpg_file" 2>/dev/null)
+  fi
+  set -e
+  
+  local normalized_fp; normalized_fp=$(echo "${fp_out:-}" | tr -d ' \t\r\n' | tr '[:lower:]' '[:upper:]')
+  
+  if [[ "$normalized_fp" == *"$expected"* ]] || [[ "$normalized_fp" == *"0EBFCD88"* ]] || [[ "$normalized_fp" == *"7EA0A9C3F273FCD8"* ]]; then
+    return 0
+  fi
+  return 1
+}
 
-# Find all repository files
+repair_docker_repo_and_gpg() {
+  echo -e "[*] Auditing Docker GPG key and sources list config..."
+  
+  local keyring_dir="/etc/apt/keyrings"
+  local gpg_file="$keyring_dir/docker.gpg"
+  local list_file="/etc/apt/sources.list.d/docker.list"
+  
+  mkdir -p "$keyring_dir"
+  chmod 755 "$keyring_dir"
+  
+  # 1. Validate Docker GPG Key
+  local gpg_ok=false
+  if [ -f "$gpg_file" ] && [ -s "$gpg_file" ]; then
+    if verify_docker_gpg_fingerprint "$gpg_file"; then
+      gpg_ok=true
+    fi
+  fi
+  
+  if [ "$gpg_ok" = "false" ]; then
+    echo -e "  - Docker GPG key missing or corrupted. Downloading/Re-installing..."
+    rm -f "$gpg_file"
+    
+    if ! command -v gpg &>/dev/null || ! command -v curl &>/dev/null; then
+      set +e
+      apt-get update -y && apt-get install -y gnupg curl ca-certificates
+      set -e
+    fi
+    
+    local download_success=false
+    local mirrors=(
+      "https://download.docker.com/linux/ubuntu/gpg"
+      "https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg"
+    )
+    for mirror in "${mirrors[@]}"; do
+      if curl -fsSL --max-time 10 "$mirror" | gpg --dearmor -o "$gpg_file" 2>/dev/null; then
+        if verify_docker_gpg_fingerprint "$gpg_file"; then
+          download_success=true
+          break
+        fi
+      fi
+      rm -f "$gpg_file"
+    done
+    
+    if [ "$download_success" = "false" ]; then
+      for mirror in "${mirrors[@]}"; do
+        if wget -qO- --timeout=10 "$mirror" | gpg --dearmor -o "$gpg_file" 2>/dev/null; then
+          if verify_docker_gpg_fingerprint "$gpg_file"; then
+            download_success=true
+            break
+          fi
+        fi
+        rm -f "$gpg_file"
+      done
+    fi
+    
+    if [ "$download_success" = "false" ]; then
+      local temp_armor; temp_armor=$(mktemp)
+      if gpg --no-default-keyring --keyring "$temp_armor" --keyserver keyserver.ubuntu.com --recv-keys 7EA0A9C3F273FCD8 2>/dev/null; then
+        gpg --no-default-keyring --keyring "$temp_armor" --export -o "$gpg_file" 2>/dev/null
+        if verify_docker_gpg_fingerprint "$gpg_file"; then
+          download_success=true
+        fi
+      fi
+      rm -f "$temp_armor" "$temp_armor~" 2>/dev/null
+    fi
+    
+    if [ "$download_success" = "false" ]; then
+      echo -e "${RED}[- ] Error: Failed to download and verify Docker GPG key.${NC}" >&2
+      return 1
+    fi
+  fi
+  
+  chmod 644 "$gpg_file"
+  
+  local arch; arch=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
+  local codename=""
+  if [ -f /etc/os-release ]; then
+    codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+  fi
+  if [ -z "$codename" ]; then
+    codename=$(lsb_release -cs 2>/dev/null || echo "focal")
+  fi
+  
+  if [[ "$codename" != "focal" && "$codename" != "jammy" && "$codename" != "noble" ]]; then
+    local ver_id; ver_id=$(. /etc/os-release && echo "$VERSION_ID")
+    if [[ "$ver_id" =~ ^20 ]]; then codename="focal";
+    elif [[ "$ver_id" =~ ^22 ]]; then codename="jammy";
+    elif [[ "$ver_id" =~ ^24 ]]; then codename="noble";
+    else codename="jammy";
+    fi
+  fi
+  
+  local expected_repo_line="deb [arch=${arch} signed-by=${gpg_file}] https://download.docker.com/linux/ubuntu ${codename} stable"
+  
+  local list_ok=true
+  if [ -f "$list_file" ]; then
+    local content; content=$(cat "$list_file" 2>/dev/null || echo "")
+    if [[ "$content" == *"\$"* ]] || [[ "$content" == *"\("* ]] || [[ "$content" != *"download.docker.com"* ]]; then
+      list_ok=false
+    fi
+    
+    local line
+    while IFS= read -r line || [ -n "$line" ]; do
+      line=$(echo "$line" | xargs)
+      [ -z "$line" ] && continue
+      [[ "$line" =~ ^# ]] && continue
+      if [[ ! "$line" =~ ^deb[[:space:]]+(\[[^]]+\][[:space:]]+)?[a-zA-Z0-9_+.-]+://[^[:space:]]+[[:space:]]+[^[:space:]]+([[:space:]]+[^[:space:]]+)*$ ]]; then
+        list_ok=false
+      fi
+    done < "$list_file"
+  else
+    list_ok=false
+  fi
+  
+  if [ "$list_ok" = "false" ]; then
+    echo -e "  - Re-writing static resolved Docker repository file..."
+    rm -f "$list_file"
+    echo "$expected_repo_line" | tee "$list_file" > /dev/null
+  fi
+  chmod 644 "$list_file"
+  
+  return 0
+}
+
+# Run Docker key and repo healing
+repair_docker_repo_and_gpg || true
+
+seen_repos_file=$(mktemp)
 files=("/etc/apt/sources.list")
 if [ -d "/etc/apt/sources.list.d" ]; then
   while IFS= read -r -d '' file; do
@@ -111,10 +253,10 @@ echo -e "${GREEN}[✔] APT repositories validated and healthy.${NC}\n"
 
 # 4. Sync package updates
 echo -e "${BLUE}[*] Running APT updates to sync states...${NC}"
-apt-get update -y || {
+apt-get update -y --allow-releaseinfo-change || {
   echo -e "${YELLOW}[!] Warning: APT update failed. Attempting cleanup of duplicate lists...${NC}"
   rm -f /var/lib/apt/lists/*
-  apt-get update -y || true
+  apt-get update -y --allow-releaseinfo-change || true
 }
 
 # 5. Fix Directories, Ownership and Permissions

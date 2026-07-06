@@ -216,6 +216,30 @@ validate_and_repair_apt_sources() {
   echo -e "${GREEN}[✔] APT repositories verified and healthy.${NC}"
 }
 
+verify_docker_gpg_fingerprint() {
+  local gpg_file="${1:-}"
+  if [ -z "$gpg_file" ] || [ ! -f "$gpg_file" ] || [ ! -s "$gpg_file" ]; then
+    return 1
+  fi
+  
+  # Official fingerprint: 9DC8 5822 9FC7 DD38 854A  E2D8 8D81 803C 0EBF CD88
+  local expected="9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
+  
+  local fp_out=""
+  set +e
+  if command -v gpg &>/dev/null; then
+    fp_out=$(gpg --show-keys --with-fingerprint "$gpg_file" 2>/dev/null || gpg --show-keys "$gpg_file" 2>/dev/null || gpg --with-colons --dry-run --import "$gpg_file" 2>/dev/null)
+  fi
+  set -e
+  
+  local normalized_fp; normalized_fp=$(echo "${fp_out:-}" | tr -d ' \t\r\n' | tr '[:lower:]' '[:upper:]')
+  
+  if [[ "$normalized_fp" == *"$expected"* ]] || [[ "$normalized_fp" == *"0EBFCD88"* ]] || [[ "$normalized_fp" == *"7EA0A9C3F273FCD8"* ]]; then
+    return 0
+  fi
+  return 1
+}
+
 repair_docker_repo_and_gpg() {
   echo -e "[*] Auditing Docker GPG key and sources list config..."
   
@@ -229,7 +253,7 @@ repair_docker_repo_and_gpg() {
   # 1. Validate Docker GPG Key
   local gpg_ok=false
   if [ -f "$gpg_file" ] && [ -s "$gpg_file" ]; then
-    if gpg --dry-run --quiet --no-default-keyring --keyring "$gpg_file" --list-keys &>/dev/null || gpg --show-keys "$gpg_file" &>/dev/null; then
+    if verify_docker_gpg_fingerprint "$gpg_file"; then
       gpg_ok=true
     fi
   fi
@@ -238,6 +262,13 @@ repair_docker_repo_and_gpg() {
     echo -e "  - Docker GPG key missing or corrupted. Downloading/Re-installing..."
     rm -f "$gpg_file"
     
+    # Pre-install gnupg and curl if missing to handle base Ubuntu image limits
+    if ! command -v gpg &>/dev/null || ! command -v curl &>/dev/null; then
+      set +e
+      apt-get update -y && apt-get install -y gnupg curl ca-certificates
+      set -e
+    fi
+    
     local download_success=false
     local mirrors=(
       "https://download.docker.com/linux/ubuntu/gpg"
@@ -245,27 +276,45 @@ repair_docker_repo_and_gpg() {
     )
     for mirror in "${mirrors[@]}"; do
       if curl -fsSL --max-time 10 "$mirror" | gpg --dearmor -o "$gpg_file" 2>/dev/null; then
-        download_success=true
-        break
+        if verify_docker_gpg_fingerprint "$gpg_file"; then
+          download_success=true
+          break
+        fi
       fi
+      rm -f "$gpg_file"
     done
     
     if [ "$download_success" = "false" ]; then
       for mirror in "${mirrors[@]}"; do
         if wget -qO- --timeout=10 "$mirror" | gpg --dearmor -o "$gpg_file" 2>/dev/null; then
-          download_success=true
-          break
+          if verify_docker_gpg_fingerprint "$gpg_file"; then
+            download_success=true
+            break
+          fi
         fi
+        rm -f "$gpg_file"
       done
     fi
     
     if [ "$download_success" = "false" ]; then
-      echo -e "${RED}[- ] Error: Failed to download Docker GPG key.${NC}" >&2
+      # Fallback to key server
+      local temp_armor; temp_armor=$(mktemp)
+      if gpg --no-default-keyring --keyring "$temp_armor" --keyserver keyserver.ubuntu.com --recv-keys 7EA0A9C3F273FCD8 2>/dev/null; then
+        gpg --no-default-keyring --keyring "$temp_armor" --export -o "$gpg_file" 2>/dev/null
+        if verify_docker_gpg_fingerprint "$gpg_file"; then
+          download_success=true
+        fi
+      fi
+      rm -f "$temp_armor" "$temp_armor~" 2>/dev/null
+    fi
+    
+    if [ "$download_success" = "false" ]; then
+      echo -e "${RED}[- ] Error: Failed to download and verify Docker GPG key.${NC}" >&2
       return 1
     fi
   fi
   
-  chmod a+r "$gpg_file"
+  chmod 644 "$gpg_file"
   
   # 2. Resolve Static Variables for the list file (Strictly No dynamic shell expressions in docker.list)
   local arch; arch=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
@@ -316,21 +365,7 @@ repair_docker_repo_and_gpg() {
     rm -f "$list_file"
     echo "$expected_repo_line" | tee "$list_file" > /dev/null
   fi
-  
-  # 4. Verify Docker signature
-  local sig_verified=false
-  set +e
-  apt-get update -o Dir::Etc::sourcelist="$list_file" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0" -y &>> "$INSTALL_LOG"
-  [ $? -eq 0 ] && sig_verified=true
-  set -e
-  
-  if [ "$sig_verified" = "false" ]; then
-    echo -e "  - ${YELLOW}Warning: Docker repository signature validation failed. Re-attempting key setup via key server...${NC}"
-    rm -f "$gpg_file" "$list_file"
-    gpg --no-default-keyring --keyring "$gpg_file" --keyserver keyserver.ubuntu.com --recv-keys 7EA0A9C3F273FCD8 || true
-    echo "$expected_repo_line" | tee "$list_file" > /dev/null
-    chmod a+r "$gpg_file"
-  fi
+  chmod 644 "$list_file"
   
   return 0
 }
@@ -357,9 +392,81 @@ repair_nodesource_repo_and_gpg() {
   chmod a+r "$gpg_file"
 }
 
-# ==============================================================================
-# SELF-HEALING ENGINE (COMPLETELY SELF-CONTAINED & MULTI-TARGET REPAIR)
-# ==============================================================================
+run_apt_update() {
+  echo -e "[*] Validating and preparing package repositories before apt update..."
+  
+  # Always ensure docker.list and general sources are healthy and verified
+  validate_and_repair_apt_sources
+  repair_docker_repo_and_gpg || true
+  repair_nodesource_repo_and_gpg || true
+  
+  local max_attempts=3
+  local delay=5
+  local attempt=1
+  local exit_code=0
+  
+  while [ $attempt -le $max_attempts ]; do
+    echo -e "  - [Attempt $attempt/$max_attempts] Syncing system package lists..."
+    set +e
+    apt-get update -y --allow-releaseinfo-change >> "$INSTALL_LOG" 2>> "$ERROR_LOG"
+    exit_code=$?
+    set -e
+    
+    if [ $exit_code -eq 0 ]; then
+      echo -e "  - ${GREEN}APT repositories synced successfully.${NC}"
+      return 0
+    fi
+    
+    echo -e "  - ${YELLOW}Warning: APT update failed on attempt $attempt. Initiating repair...${NC}"
+    auto_repair_infrastructure "APT update failure"
+    
+    attempt=$((attempt+1))
+    [ $attempt -le $max_attempts ] && sleep "$delay"
+  done
+  
+  echo -e "  - ${RED}Error: APT update failed repeatedly. Aborting.${NC}" >&2
+  return 1
+}
+
+install_package_with_retry() {
+  local pkg="$1"
+  local max_attempts=3
+  local delay=5
+  echo -e "  - Installing package: ${BOLD}$pkg${NC}..."
+  
+  # Pre-checks for locks
+  set +e
+  rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/lib/dpkg/lock 2>/dev/null
+  set -e
+  
+  local attempt=1
+  while [ $attempt -le $max_attempts ]; do
+    local exit_code=0
+    set +e
+    apt-get install -y "$pkg" >> "$INSTALL_LOG" 2>> "$ERROR_LOG"
+    exit_code=$?
+    set -e
+    
+    if [ $exit_code -eq 0 ]; then
+      echo -e "    - ${GREEN}Package $pkg installed successfully.${NC}"
+      return 0
+    fi
+    
+    echo -e "    - ${YELLOW}Warning: Failed to install $pkg on attempt $attempt/$max_attempts. Invoking self-healing...${NC}"
+    auto_repair_infrastructure "Package $pkg install failure"
+    
+    set +e
+    dpkg --configure -a >> "$INSTALL_LOG" 2>> "$ERROR_LOG"
+    apt-get install -f -y >> "$INSTALL_LOG" 2>> "$ERROR_LOG"
+    set -e
+    
+    attempt=$((attempt+1))
+    [ $attempt -le $max_attempts ] && sleep "$delay"
+  done
+  
+  echo -e "  - ${RED}Error: Failed to install package $pkg after $max_attempts attempts.${NC}" >&2
+  return 1
+}
 
 auto_repair_infrastructure() {
   local root_cause="${1:-Self-healing diagnostic check}"
@@ -460,12 +567,12 @@ verify_docker_prerequisites() {
   
   validate_and_repair_apt_sources
   
-  if [ ! -f "/etc/apt/keyrings/docker.gpg" ] || ! gpg --show-keys "/etc/apt/keyrings/docker.gpg" &>/dev/null; then
+  if [ ! -f "/etc/apt/keyrings/docker.gpg" ] || ! verify_docker_gpg_fingerprint "/etc/apt/keyrings/docker.gpg"; then
     echo -e "${RED}[- ] Error: GPG verification for Docker key failed.${NC}" >&2
     return 1
   fi
   
-  if ! apt-get update -o Dir::Etc::sourcelist="/etc/apt/sources.list.d/docker.list" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0" -y &>/dev/null; then
+  if ! run_apt_update; then
     echo -e "${RED}[- ] Error: APT update of Docker repository failed.${NC}" >&2
     return 1
   fi
@@ -851,10 +958,9 @@ echo ""
 
 # 6. UPDATE SYSTEM PACKAGE LIST & VALIDATE REPOS
 echo -e "${BLUE}[1/13] Syncing system package repositories...${NC}"
-validate_and_repair_apt_sources
 echo -e "  - Running baseline apt repository update..."
-if ! retry_command 3 5 "Updating APT package cache" "Check package manager locks or internet access" "apt-get update -y"; then
-  log_failure $? "apt-get update" "Broken third-party repositories or networking restrictions" "validate_and_repair_apt_sources" "Unresolved"
+if ! run_apt_update; then
+  log_failure 1 "run_apt_update" "Broken third-party repositories or networking restrictions" "auto_repair_infrastructure" "Unresolved"
   exit 1
 fi
 echo -e "${GREEN}[✔] Package lists updated.${NC}\n"
@@ -890,7 +996,7 @@ if [ "$NODE_READY" = false ]; then
      rm -f /etc/apt/keyrings/nodesource.gpg && \
      curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
      echo 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main' | tee /etc/apt/sources.list.d/nodesource.list && \
-     apt-get update -y"
+     run_apt_update"
   
   install_package_with_retry "nodejs"
 fi
