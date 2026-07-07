@@ -20,15 +20,16 @@ const JWT_SECRET = process.env.JWT_SECRET || 'streampulse_default_secret_key_984
 
 // Initialize Gemini SDK with server-side API key securely
 let ai: GoogleGenAI | null = null;
-if (process.env.GEMINI_API_KEY) {
+const effectiveApiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
+if (effectiveApiKey) {
   try {
-    ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+    ai = new GoogleGenAI({ apiKey: effectiveApiKey });
     console.log('Gemini API client initialized successfully server-side.');
   } catch (err) {
     console.error('Error initializing Gemini SDK:', err);
   }
 } else {
-  console.log('GEMINI_API_KEY not found in environment variables. Running in simulation mode.');
+  console.log('GEMINI_API_KEY or API_KEY not found in environment variables. Running in simulation mode.');
 }
 
 async function startServer() {
