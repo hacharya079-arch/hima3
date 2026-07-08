@@ -668,9 +668,6 @@ check_config_and_db() {
   db_name=$(get_env_val "DB_NAME" "$env_path" "")
   jwt_secret=$(get_env_val "JWT_SECRET" "$env_path" "")
   gemini_key=$(get_env_val "GEMINI_API_KEY" "$env_path" "")
-  if [ -z "$gemini_key" ]; then
-    gemini_key=$(get_env_val "API_KEY" "$env_path" "")
-  fi
 
   local missing_properties=()
   [ -z "$db_host" ] && missing_properties+=("DB_HOST")
